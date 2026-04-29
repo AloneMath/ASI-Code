@@ -2,7 +2,7 @@
 
 **A modern terminal coding agent in Rust.** Single binary. No Node.js runtime required, and no npm install step. Runs against **DeepSeek**, **OpenAI**, or **Claude** with the same workflow.
 
-Same UX as Claude Code / Cursor / Codex — REPL with slash commands, streaming output, auto-tool loop, work / code / secure / review modes, sub-agents, MCP server support, plugin system, agent skills, cron jobs, git worktrees, sandbox + audit log, and a 60+ command surface.
+Inspired by modern coding-agent CLIs, with a similar workflow and UX: REPL with slash commands, streaming output, auto-tool loop, work / code / secure / review modes, sub-agents, MCP server support, plugin system, agent skills, cron jobs, git worktrees, sandbox + audit log, and a 60+ command surface.
 
 ```powershell
 # 30-second quickstart (Windows / PowerShell)
@@ -12,7 +12,9 @@ cargo run --release -- repl --provider deepseek --model deepseek-v4-pro --projec
 
 ---
 
-ASI Code is a terminal coding agent with a Claude Code style workflow, built in Rust.
+ASI Code is a Rust-built terminal coding agent with a workflow similar to modern coding-agent CLIs.
+
+This project is independent and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Anysphere, or any other model/tool provider.
 
 ## Implemented Features
 - Interactive REPL with slash commands and streaming output
@@ -859,7 +861,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_
   -SummaryOutFile ".\artifacts\risk_recipe_live\SUMMARY_SMOKE_ALL_GATEWAY_RISK.md"
 ```
 
-Recommended OpenAI official template (copy and run):
+Recommended template for the OpenAI API endpoint (copy and run):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_recipes.ps1 `
