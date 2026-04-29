@@ -1,0 +1,117 @@
+﻿name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check (release)
+        run: cargo check --release
+
+      - name: Cargo test (release)
+        run: cargo test --release
+
+      - name: Windows smoke (quick local)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .\artifacts | Out-Null
+          ./scripts/windows/smoke_all.ps1 `
+            -AsiExe ./target/release/asi.exe `
+            -Project . `
+            -Repo . `
+            -Quick `
+            -SkipGateway `
+            -ReportJsonPath .\artifacts\smoke_all_local.json
+
+      - name: Windows smoke (gateway + tools)
+        if: matrix.os == 'windows-latest' && secrets.OPENAI_BASE_URL != '' && secrets.OPENAI_API_KEY != ''
+        shell: pwsh
+        env:
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: |
+          $model = if ([string]::IsNullOrWhiteSpace($env:OPENAI_MODEL)) { 'gpt-5.3-codex' } else { $env:OPENAI_MODEL }
+          ./scripts/windows/smoke_all.ps1 `
+            -AsiExe ./target/release/asi.exe `
+            -Project . `
+            -Repo . `
+            -Quick `
+            -RunGateway `
+            -SkipProviderModel `
+            -SkipCheckpoint `
+            -GatewayRetries 3 `
+            -GatewayTimeoutSecs 150 `
+            -OpenAiBaseUrl $env:OPENAI_BASE_URL `
+            -OpenAiApiKey $env:OPENAI_API_KEY `
+            -OpenAiModel $model `
+            -ReportJsonPath .\artifacts\smoke_all_gateway.json
+
+      - name: Build smoke summary
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          ./scripts/windows/render_smoke_summary.ps1 `
+            -ReportDir .\artifacts `
+            -OutFile $env:GITHUB_STEP_SUMMARY `
+            -Append
+
+      - name: Windows machine-readable CI report
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: |
+          $provider = if (-not [string]::IsNullOrWhiteSpace($env:DEEPSEEK_API_KEY)) { "deepseek" } elseif (-not [string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) { "openai" } else { "deepseek" }
+          $openaiModel = if ([string]::IsNullOrWhiteSpace($env:OPENAI_MODEL)) { "gpt-5.3-codex" } else { $env:OPENAI_MODEL }
+          $deepseekModel = if ([string]::IsNullOrWhiteSpace($env:DEEPSEEK_MODEL)) { "deepseek-reasoner" } else { $env:DEEPSEEK_MODEL }
+          ./scripts/windows/ci_machine_json.ps1 `
+            -Provider $provider `
+            -ArtifactsDir .\artifacts\ci_machine_json `
+            -OutJson .\artifacts\ci_machine_json\ci_machine_report.json `
+            -OpenAiBaseUrl $env:OPENAI_BASE_URL `
+            -OpenAiApiKey $env:OPENAI_API_KEY `
+            -OpenAiModel $openaiModel `
+            -DeepSeekBaseUrl $env:DEEPSEEK_BASE_URL `
+            -DeepSeekApiKey $env:DEEPSEEK_API_KEY `
+            -DeepSeekModel $deepseekModel `
+            -AllowProviderNetworkError `
+            -AllowReviewJsonNetworkError `
+            -AllowSubagentNetworkError `
+            -AllowGatewayNetworkError
+
+      - name: Upload smoke report artifacts
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-reports-${{ matrix.os }}
+          path: artifacts/*.json
+          if-no-files-found: warn
+
+      - name: Upload machine CI report artifacts
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-machine-report-${{ matrix.os }}
+          path: artifacts/ci_machine_json/*.json
+          if-no-files-found: warn

@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "require_step_status": "pass",
+  "require_report_status_pass": [
+    "smoke",
+    "smoke_prompt_jsonl"
+  ],
+  "allow_missing_reports": []
+}

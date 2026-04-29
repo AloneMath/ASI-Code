@@ -1,0 +1,8 @@
+﻿blank_issues_enabled: false
+contact_links:
+  - name: Product Feedback (Discussions)
+    url: https://github.com/<OWNER>/<REPO>/discussions
+    about: Use discussions for ideas, UX feedback, and roadmap topics.
+  - name: Security Reports
+    url: https://github.com/<OWNER>/<REPO>/security/advisories/new
+    about: Report vulnerabilities privately.

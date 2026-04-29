@@ -1,0 +1,67 @@
+﻿name: Bug report
+description: Report a reproducible bug
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please provide a minimal reproducible case.
+  - type: input
+    id: version
+    attributes:
+      label: ASI Code version
+      placeholder: v0.3.0-beta.1
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - OpenAI
+        - DeepSeek
+        - Claude
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include exact command input when possible.
+      placeholder: |
+        1. Run ...
+        2. Input ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Remove API keys and secrets before posting.
+      render: shell
+    validations:
+      required: false

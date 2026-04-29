@@ -1,0 +1,60 @@
+{
+  "handlers": [
+    {
+      "event": "PreToolUse",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\pre_tool_use.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    },
+    {
+      "event": "PermissionRequest",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\permission_request_strict.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true,
+      "tool_prefix": "bash",
+      "permission_mode": "workspace-write"
+    },
+    {
+      "event": "PostToolUse",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\post_tool_use.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    },
+    {
+      "event": "SessionStart",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\lifecycle_event.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    },
+    {
+      "event": "UserPromptSubmit",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\lifecycle_event.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    },
+    {
+      "event": "Stop",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\lifecycle_event.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    },
+    {
+      "event": "SubagentStop",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\lifecycle_event.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    },
+    {
+      "event": "PreCompact",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\lifecycle_event.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    },
+    {
+      "event": "PostCompact",
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\Code\\Rust\\scripts\\windows\\hooks\\lifecycle_event.ps1\"",
+      "timeout_secs": 10,
+      "json_protocol": true
+    }
+  ]
+}

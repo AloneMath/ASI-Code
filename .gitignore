@@ -1,0 +1,77 @@
+# ============================================================
+# Rust build artifacts
+# ============================================================
+/target/
+/target_smoke/
+/Cargo.lock.bak
+
+# ============================================================
+# Release / package artifacts
+# ============================================================
+/dist/
+/bench_reports/
+/artifacts/
+
+# ============================================================
+# Runtime / session artifacts (never commit per-user state)
+# ============================================================
+/sessions/
+/.asi/
+/.asi_audit.jsonl
+/.asi_mcp_state.json
+/.asi_plugins.json
+asi_audit_report_*.json
+asi_audit_report_*.md
+
+# ============================================================
+# Local debug / scratch / temp files
+# ============================================================
+/_prompt_input.txt
+/_stdin_source.txt
+/_smoke_out.log
+/_smoke_*.txt
+/_test_cli_input.txt
+/_test_cli_output*.log
+/_asi_write_test*.txt
+/_codex_write_test*.txt
+/_write_probe*.txt
+/.write_test.txt
+/.codex_write_test.txt
+
+# In-progress / experimental files left behind by refactors
+/main_pruned_tmp.rs
+/tmp_cjk.pdb
+/tmp_guard.rs
+/tmp_guard_json.rs
+/tmp_ctx_status/
+/tmp_hook_tpl/
+/tmp_hooks/
+/tmp_hooks_json/
+/tmp_mcp_io/
+/tmp_mcp_io2/
+/tmp_mcp_test/
+/tmp/
+
+# ============================================================
+# Editor / IDE
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*~
+
+# ============================================================
+# OS junk
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Secrets — never commit .env or local config that holds keys
+# ============================================================
+.env
+.env.*
+!.env.example
+config.local.json
+config.json

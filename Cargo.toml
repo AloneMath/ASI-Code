@@ -1,0 +1,28 @@
+﻿[package]
+name = "asi-code"
+version = "0.3.0"
+edition = "2021"
+authors = ["ASI Code Team"]
+description = "ASI Code terminal agent - Rust implementation of Claude Code"
+license = "MIT"
+repository = "https://github.com/example/asi-code"
+readme = "README.md"
+
+[[bin]]
+name = "asi"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+glob = "0.3"
+regex = "1"
+sha2 = "0.10"
+rpassword = "7.3"
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+# Error handling - keep this as it's useful
+thiserror = "1.0"
