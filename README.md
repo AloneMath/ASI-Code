@@ -54,7 +54,7 @@ ASI Code is a terminal coding agent with a Claude Code style workflow, built in 
 
 ```powershell
 cd "D:\Code\Rust"
-cargo run --offline -- repl --project "D:\Code\YourProject" --provider deepseek --model deepseek-chat
+cargo run --offline -- repl --project "D:\Code\YourProject" --provider deepseek --model deepseek-v4-pro
 ```
 
 ## Standalone Windows Install (No npm/pnpm)
