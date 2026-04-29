@@ -8,6 +8,15 @@ Inspired by modern coding-agent CLIs, with a similar workflow and UX: REPL with 
 # 30-second quickstart (Windows / PowerShell)
 $env:DEEPSEEK_API_KEY = "sk-..."
 cargo run --release -- repl --provider deepseek --model deepseek-v4-pro --project D:\your-project --no-setup
+
+OpenAI/Claude native tool_use
+# OpenAI
+$env:OPENAI_API_KEY = "sk-..."
+cargo run --release -- repl --provider openai --model <openai-model> --project D:\your-project --no-setup
+
+# Claude
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+cargo run --release -- repl --provider claude --model <claude-model> --project D:\your-project --no-setup
 ```
 
 ---
