@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["ASI Code Team"]
 description = "ASI Code terminal agent - Rust implementation of Claude Code"
 license = "MIT"
-repository = "https://github.com/example/asi-code"
+repository = "https://github.com/AloneMath/asi-code"
 readme = "README.md"
 
 [[bin]]
