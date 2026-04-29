@@ -68,6 +68,42 @@ This project is independent and is not affiliated with, endorsed by, or sponsore
 cd "D:\Code\Rust"
 cargo run --offline -- repl --project "D:\Code\YourProject" --provider deepseek --model deepseek-v4-pro
 ```
+## Real CLI Execution Example
+
+The CLI can execute real long-running tasks through tool calls, with approval gating, live progress, and artifact output.
+
+### Command
+```text
+/toolcall bash command="cd D:\\test_code; python train_nn.py 2>&1"
+
+What happened
+Prompted for approval first (permission_mode=on-request)
+Executed the command after approval
+Streamed heartbeat logs during long execution (INFO bash still running ...)
+Returned full training output
+Saved generated artifact to disk:
+D:/test_code/training_results.png
+
+### Saved artifact files
+<img width="297" height="95" alt="屏幕截图 2026-04-30 003326" src="https://github.com/user-attachments/assets/5ba3875f-a81e-494c-9480-7836d58352bb" />
+
+Sample output excerpt
+Training PyTorch model for 1500 epochs...
+Epoch  300/1500 | train_loss: 0.0034 | val_loss: 0.0036 | val_acc: 1.0000
+Epoch  600/1500 | train_loss: 0.0006 | val_loss: 0.0008 | val_acc: 1.0000
+...
+Epoch 1500/1500 | train_loss: 0.0001 | val_loss: 0.0001 | val_acc: 1.0000
+Plot saved to: D:/test_code/training_results.png
+TOOL bash (ok)
+
+### Generated artifact preview
+<img width="1335" height="950" alt="Figure_1" src="https://github.com/user-attachments/assets/d80a2e40-db4d-4456-b0e1-1b337e90148e" />
+
+This demonstrates three core behaviors:
+
+1.Safe execution control (approval gate)
+2.Reliable long-task handling (progress heartbeat + streaming logs)
+3.End-to-end task completion (command success + output artifact)
 
 ## Standalone Windows Install (No npm/pnpm)
 
