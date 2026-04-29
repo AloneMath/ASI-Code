@@ -1,6 +1,6 @@
 ﻿# ASI Code
 
-**A modern terminal coding agent in Rust.** Single binary. No Node.js, no `npm install`. Runs against **DeepSeek**, **OpenAI**, or **Claude** with the same workflow.
+**A modern terminal coding agent in Rust.** Single binary. No Node.js runtime required, and no npm install step. Runs against **DeepSeek**, **OpenAI**, or **Claude** with the same workflow.
 
 Same UX as Claude Code / Cursor / Codex — REPL with slash commands, streaming output, auto-tool loop, work / code / secure / review modes, sub-agents, MCP server support, plugin system, agent skills, cron jobs, git worktrees, sandbox + audit log, and a 60+ command surface.
 
