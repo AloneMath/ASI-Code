@@ -6,6 +6,7 @@ Inspired by modern coding-agent CLIs, with a similar workflow and UX: REPL with 
 
 ```powershell
 # 30-second quickstart (Windows / PowerShell)
+# DeepSeek
 $env:DEEPSEEK_API_KEY = "sk-..."
 cargo run --release -- repl --provider deepseek --model deepseek-v4-pro --project D:\your-project --no-setup
 
