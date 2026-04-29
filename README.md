@@ -7,7 +7,7 @@ Same UX as Claude Code / Cursor / Codex — REPL with slash commands, streaming 
 ```powershell
 # 30-second quickstart (Windows / PowerShell)
 $env:DEEPSEEK_API_KEY = "sk-..."
-cargo run --release -- repl --provider deepseek --model deepseek-chat --project D:\your-project --no-setup
+cargo run --release -- repl --provider deepseek --model deepseek-v4-pro --project D:\your-project --no-setup
 ```
 
 ---
