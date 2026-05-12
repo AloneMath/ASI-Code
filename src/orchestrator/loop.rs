@@ -449,12 +449,44 @@ fn run_tool_loop_core(
     let mut plan_handshake_done = false;
     let mut confidence_gate_retries = 0usize;
     let mut zero_toolcall_nudge_attempted = false;
+    let mut pending_action_nudge_count = 0usize;
     let mut strict_forced_execution_attempts = 0usize;
     let mut bilingual_md_retries = 0usize;
     let mut review_schema_retries = 0usize;
     let started = Instant::now();
 
+    // Auto-compaction threshold for long-running tasks. Default ~120K input
+    // tokens (well below modern model caps but above what fits comfortably
+    // in a single hot context). Override via ASI_AUTO_COMPACT_INPUT_TOKENS=0
+    // to disable, or any positive integer to tune.
+    let auto_compact_threshold: usize = std::env::var("ASI_AUTO_COMPACT_INPUT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(120_000);
+    let mut auto_compactions_done: usize = 0;
+
     loop {
+        // Auto-trigger smart compaction when the cumulative input-token
+        // budget is approaching the model's context cap. This is what
+        // makes overnight 8-hour-plus tasks possible without context
+        // exhaustion — we summarize once we cross the threshold, then
+        // continue with a fresh head + recent tail.
+        if auto_compact_threshold > 0 && auto_compactions_done < 8 {
+            if let Some(reason) = rt.auto_compact_recommendation(auto_compact_threshold) {
+                loop_info(
+                    mode,
+                    ui,
+                    &format!(
+                        "auto-agent: auto-compacting context ({}). Summarizing then continuing.",
+                        reason
+                    ),
+                );
+                let msg = rt.compact_with_summary(8);
+                loop_info(mode, ui, &msg);
+                auto_compactions_done += 1;
+            }
+        }
+
         if let Some(reason) = auto_loop_stop_reason_at_loop_head(
             started,
             limits,
@@ -880,6 +912,49 @@ fn run_tool_loop_core(
                 zero_toolcall_nudge_attempted = true;
                 let nudge_prompt =
                     build_zero_toolcall_nudge_prompt(&anchored_context, task_input, strict_mode);
+                let (nudged, streamed) = run_turn_for_mode(rt, cfg, mode, ui, &nudge_prompt);
+                cache_read_file_from_tool_result(file_synopsis_cache, &nudged);
+                render_turn_output_for_mode(mode, ui, markdown_render, &nudged, streamed, true);
+                if nudged.stop_reason == "provider_error" {
+                    current = nudged;
+                    break;
+                }
+                extra_cost += nudged.turn_cost_usd;
+                if matches!(mode, LoopMode::ReplVerbose) {
+                    record_native_changed_files_for_mode(
+                        mode,
+                        &nudged.native_tool_calls,
+                        changed_files,
+                        change_events.as_deref_mut(),
+                        ui,
+                    );
+                } else {
+                    collect_native_changed_files(&nudged.native_tool_calls, changed_files);
+                }
+                steps += 1;
+                current = nudged;
+                if !is_auto_loop_continuable_stop_reason(&current.stop_reason) {
+                    break;
+                }
+                continue;
+            }
+            // Mid-loop "promise-of-work" detector. Some provider models
+            // (notably gpt-5.3-codex via third-party gateways) emit prose
+            // like "If you allow, I'll do X next" without populating
+            // `tool_calls`, then stop. The existing `zero_toolcall_nudge`
+            // only fires at steps <= 1; this branch fires whenever we see
+            // a clear pending-action promise with no actionable tool call
+            // emitted. Capped at 2 attempts per loop to avoid infinite
+            // back-and-forth.
+            if pending_action_nudge_count < 2 && looks_like_pending_action_promise(&current.text) {
+                pending_action_nudge_count += 1;
+                loop_info(
+                    mode,
+                    ui,
+                    "auto-agent: model promised action without tool_calls; nudging continue",
+                );
+                let nudge_prompt =
+                    build_pending_action_continue_prompt(&anchored_context, task_input);
                 let (nudged, streamed) = run_turn_for_mode(rt, cfg, mode, ui, &nudge_prompt);
                 cache_read_file_from_tool_result(file_synopsis_cache, &nudged);
                 render_turn_output_for_mode(mode, ui, markdown_render, &nudged, streamed, true);

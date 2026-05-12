@@ -2865,8 +2865,31 @@ fn run_repl(
             continue;
         }
         if line == "/compact" {
+            // Smart compaction by default: summarize the dropped history
+            // via the current provider, keep last 8 turns verbatim. This
+            // is the Claude-Code-style behavior that makes 30-hour
+            // overnight tasks possible.
+            println!("{}", ui.info(&rt.compact_with_summary(8)));
+            continue;
+        }
+        if line == "/compact lossy" {
+            // Old lossy behavior — just drop early turns, no summary.
+            // Useful when you finished a self-contained subtask and don't
+            // want to spend tokens on a summary call.
             println!("{}", ui.info(&rt.compact(8)));
             continue;
+        }
+        if let Some(arg) = line.strip_prefix("/compact ") {
+            let arg = arg.trim();
+            if let Some(n_str) = arg.strip_prefix("smart") {
+                let n: usize = n_str.trim().parse().unwrap_or(8);
+                println!("{}", ui.info(&rt.compact_with_summary(n)));
+                continue;
+            }
+            if let Ok(n) = arg.parse::<usize>() {
+                println!("{}", ui.info(&rt.compact_with_summary(n)));
+                continue;
+            }
         }
         if line == "/clear" {
             rt.clear();
@@ -10823,6 +10846,101 @@ fn looks_like_toolcall_required_intent(text: &str) -> bool {
         || lower.contains("continue using tool results")
 }
 
+/// Detect prose that promises an action ("I'll do X next") without actually
+/// emitting any tool call in the response. Some provider models —
+/// gpt-5.3-codex via third-party gateways especially — return a polite
+/// "ask permission to continue" instead of using the `tool_calls` field.
+/// We catch the most common phrasings and trigger a mid-loop nudge.
+pub(crate) fn looks_like_pending_action_promise(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let promise_markers = [
+        "i can proceed immediately",
+        "i'll immediately perform",
+        "i will immediately perform",
+        "if you allow",
+        "if you want, i'll",
+        "if you want, i will",
+        "if you'd like, i'll",
+        "if you'd like, i will",
+        "please confirm and i'll",
+        "please confirm and i will",
+        "allow me to",
+        "i need permission",
+        "i need to read",
+        "i still need to",
+        "i'll do",
+        "i will do",
+        "let me know if i should",
+        "shall i proceed",
+        "should i proceed",
+        "allow one more tool round",
+        "one more tool round",
+        "ready to proceed",
+        "analysis complete, but",
+        "i'll perform the required",
+        "i will perform the required",
+        "i can immediately",
+        "remaining steps in order",
+    ];
+    if promise_markers.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+
+    // Secondary heuristic: the model openly admits the task is incomplete
+    // (e.g. "no edits were made and tests were not run", "the task is not
+    // completed"). Pair an "incompleteness" admission with an "absence of
+    // action" admission to keep false positives low.
+    let admits_incomplete = [
+        "task is not completed",
+        "task is not complete",
+        "not yet complete",
+        "still incomplete",
+        "still pending",
+        "still to be done",
+        "not finished",
+    ];
+    let admits_no_action = [
+        "no edits were made",
+        "no edit was made",
+        "no edits have been made",
+        "tests were not run",
+        "tests have not been run",
+        "have not yet run",
+        "have not been run",
+        "file was not modified",
+        "file has not been modified",
+        "no changes were applied",
+        "no changes have been applied",
+        "no write was performed",
+        "no file was written",
+    ];
+    if admits_incomplete.iter().any(|m| lower.contains(m))
+        && admits_no_action.iter().any(|m| lower.contains(m))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Build a follow-up prompt that pushes the model past its "ask permission"
+/// stall. Repeats the task anchor and explicitly grants permission for the
+/// remaining tool calls.
+pub(crate) fn build_pending_action_continue_prompt(
+    context_contract: &str,
+    task: &str,
+) -> String {
+    let anchor = task_anchor_line(task);
+    format!(
+        "{}\n{}\n\nYou said you would perform the next steps but did NOT emit any tool call. \
+You already have full permission to proceed. Execute every remaining step right now in a single response — \
+do not ask for confirmation, do not summarize what you will do, do not stop to report. \
+Use native tool calls (the API tool_use field), or `/toolcall NAME ARGS` lines if you can't. \
+After the tools run and you have actual results, give the final answer.",
+        context_contract, anchor
+    )
+}
+
 fn task_anchor_line(task: &str) -> String {
     let compact = task
         .trim()
@@ -11894,7 +12012,19 @@ fn collect_native_changed_paths(native_tool_calls: &[runtime::NativeToolResult])
             continue;
         }
 
-        if let Some(path) = parse_file_path_arg(&nr.tool_args_display) {
+        // `tool_args_display` is formatted as "{tool_name} {args}" in
+        // runtime.rs. Strip the leading "{tool_name} " prefix before parsing
+        // the path so we don't accidentally treat the tool name as part of
+        // the file path (e.g. `write_file hello.py` -> incorrectly emit
+        // `changed_files=write_file hello.py`, which then breaks
+        // auto-validation when it tries to `py_compile` a literal file
+        // named `write_file hello.py`).
+        let raw_args = nr
+            .tool_args_display
+            .strip_prefix(&format!("{} ", nr.tool_name))
+            .unwrap_or(&nr.tool_args_display);
+
+        if let Some(path) = parse_file_path_arg(raw_args) {
             push_unique_changed_file(&mut out, &path);
         }
     }

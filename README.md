@@ -10,7 +10,7 @@ Inspired by modern coding-agent CLIs, with a similar workflow and UX: REPL with 
 $env:DEEPSEEK_API_KEY = "sk-..."
 cargo run --release -- repl --provider deepseek --model deepseek-v4-pro --project D:\your-project --no-setup
 
-OpenAI/Claude native tool_use
+# OpenAI/Claude native tool_use
 # OpenAI
 $env:OPENAI_API_KEY = "sk-..."
 cargo run --release -- repl --provider openai --model <openai-model> --project D:\your-project --no-setup
@@ -98,6 +98,38 @@ This demonstrates three core behaviors:
 1.Safe execution control (approval gate)
 2.Reliable long-task handling (progress heartbeat + streaming logs)
 3.End-to-end task completion (command success + output artifact)
+
+## Real CLI Execution Example
+
+The CLI can execute real long-running tasks through tool calls, with approval gating, live progress, and artifact output.
+
+### Command
+```text
+/toolcall bash command="cd D:\\test_code; python train_nn.py 2>&1"
+
+What happened
+Prompted for approval first (permission_mode=on-request)
+Executed the command after approval
+Streamed heartbeat logs during long execution (INFO bash still running ...)
+Returned full training output
+Saved generated artifact to disk:
+D:/test_code/training_results.png
+
+Sample output excerpt
+Training PyTorch model for 1500 epochs...
+Epoch  300/1500 | train_loss: 0.0034 | val_loss: 0.0036 | val_acc: 1.0000
+Epoch  600/1500 | train_loss: 0.0006 | val_loss: 0.0008 | val_acc: 1.0000
+...
+Epoch 1500/1500 | train_loss: 0.0001 | val_loss: 0.0001 | val_acc: 1.0000
+Plot saved to: D:/test_code/training_results.png
+TOOL bash (ok)
+
+This demonstrates three core behaviors:
+
+1.Safe execution control (approval gate)
+2.Reliable long-task handling (progress heartbeat + streaming logs)
+3.End-to-end task completion (command success + output artifact)
+
 
 ## Standalone Windows Install (No npm/pnpm)
 

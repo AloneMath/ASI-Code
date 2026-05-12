@@ -1918,6 +1918,11 @@ impl Runtime {
         self.next_additional_directories.clear();
     }
 
+    /// Lossy compaction: keep system + last `keep_last` user/assistant
+    /// messages, drop everything else without summarizing. Use when you
+    /// know the dropped history isn't needed — e.g. you just finished a
+    /// self-contained subtask. For long-running tasks where context
+    /// matters, prefer `compact_with_summary`.
     pub fn compact(&mut self, keep_last: usize) -> String {
         let hooks = Self::load_hook_config();
         for outcome in run_event_hooks(
@@ -1957,6 +1962,170 @@ impl Runtime {
             &self.permission_mode,
         );
         format!("Compacted conversation; removed {} messages", removed)
+    }
+
+    /// Smart compaction for long-running tasks (the Claude-Code-style
+    /// "30 hours overnight" use case).
+    ///
+    /// Instead of just dropping early turns, this asks the current provider
+    /// to write a **structured summary** of everything between the system
+    /// prompt and the last `keep_last` turns. The summary replaces the
+    /// dropped history as a synthetic assistant message, so:
+    ///   - original task goal,
+    ///   - files touched + how,
+    ///   - decisions / failed approaches,
+    ///   - outstanding TODOs,
+    /// all survive into the post-compaction conversation. The recent
+    /// `keep_last` user/assistant messages stay verbatim so the model
+    /// retains short-term context.
+    ///
+    /// Returns a human-readable result string. On provider error we fall
+    /// back to lossy `compact` so the operation never leaves the runtime
+    /// in a half-state.
+    pub fn compact_with_summary(&mut self, keep_last: usize) -> String {
+        let hooks = Self::load_hook_config();
+        for outcome in run_event_hooks(
+            &hooks,
+            "PreCompact",
+            "runtime",
+            "runtime_compact",
+            &self.permission_mode,
+        ) {
+            if !outcome.allow {
+                return format!("Compact denied: hook PreCompact denied: {}", outcome.reason);
+            }
+        }
+
+        // Separate history into [system, ...drop_region, ...keep_tail].
+        let system_msg = self.messages.first().cloned();
+        let mut tail: Vec<ChatMessage> = self
+            .messages
+            .iter()
+            .skip(1)
+            .filter(|m| m.role == "user" || m.role == "assistant")
+            .cloned()
+            .collect();
+        let kept_count = keep_last.min(tail.len());
+        let keep_tail = tail.split_off(tail.len() - kept_count);
+        let drop_region = tail;
+
+        // Nothing to compact.
+        if drop_region.is_empty() {
+            return "Compact skipped: nothing to summarize.".to_string();
+        }
+
+        // Build a compact transcript of the drop region. Truncate each
+        // message to ~600 chars so the summarization prompt stays under
+        // a reasonable token cost even for very long sessions.
+        let mut transcript = String::new();
+        for (i, m) in drop_region.iter().enumerate() {
+            let snippet = if m.content.chars().count() > 600 {
+                let head: String = m.content.chars().take(600).collect();
+                format!("{}…[truncated {} chars]", head, m.content.chars().count() - 600)
+            } else {
+                m.content.clone()
+            };
+            transcript.push_str(&format!("---\n#{} [{}]:\n{}\n", i + 1, m.role, snippet));
+        }
+
+        let summary_instructions = "You are summarizing an in-progress long-running coding session so it can be \
+continued without losing critical state. Output ONLY the summary, no preamble. Use these sections, in this order, each at most a few sentences:\n\
+\n\
+1. ORIGINAL TASK: the user's overall goal (one sentence).\n\
+2. WORK DONE: bullet list of concrete actions completed (which files were read/written/edited, which commands ran, which tests passed). Cite paths verbatim.\n\
+3. KEY FACTS: anything the next turn needs to know — important file contents, decisions made, library versions, environment specifics.\n\
+4. FAILED APPROACHES: things tried that did NOT work, so we don't repeat them.\n\
+5. OUTSTANDING WORK: bullet list of TODOs that remain.\n\
+6. RECENT CONTEXT: one-line note on what the very last turn was about, since the most recent messages are kept verbatim after this summary.\n\
+\n\
+Keep the whole summary under 800 tokens. Be specific, not generic.";
+
+        let summary_msgs = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: summary_instructions.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: format!(
+                    "Summarize the following session transcript (the head is the oldest, the tail is the most recent).\n\n{}",
+                    transcript
+                ),
+            },
+        ];
+
+        let mut summary_text = String::new();
+        let summary_call = self
+            .client
+            .complete_streaming_dyn(&summary_msgs, &mut |delta| {
+                summary_text.push_str(delta);
+            });
+
+        let removed = drop_region.len();
+        let result_msg = match summary_call {
+            Ok(_) if !summary_text.trim().is_empty() => {
+                // Inject the summary as a synthetic assistant message so the
+                // model treats it as authoritative history. Wrap with a clear
+                // boundary header so downstream prompts and reviewers can see
+                // exactly where the compaction kicked in.
+                let synthesized = ChatMessage {
+                    role: "assistant".to_string(),
+                    content: format!(
+                        "[COMPACTED CONTEXT — summary of earlier turns]\n{}\n[END OF COMPACTED SUMMARY]",
+                        summary_text.trim()
+                    ),
+                };
+                let mut new_msgs: Vec<ChatMessage> = Vec::with_capacity(2 + keep_tail.len());
+                if let Some(sys) = system_msg {
+                    new_msgs.push(sys);
+                }
+                new_msgs.push(synthesized);
+                new_msgs.extend(keep_tail);
+                self.messages = new_msgs;
+                format!(
+                    "Compacted conversation with structured summary; removed {} messages, kept {} recent",
+                    removed, kept_count
+                )
+            }
+            _ => {
+                // Provider error or empty summary: don't leave a half-broken
+                // state. Fall back to plain lossy compact so the user at
+                // least gets the context cap they asked for.
+                let head: Vec<ChatMessage> = system_msg.into_iter().collect();
+                self.messages = [head, keep_tail].concat();
+                format!(
+                    "Smart compact failed (provider returned empty); fell back to lossy compact. Removed {} messages.",
+                    removed
+                )
+            }
+        };
+
+        let _ = run_event_hooks(
+            &hooks,
+            "PostCompact",
+            "runtime",
+            "runtime_compact",
+            &self.permission_mode,
+        );
+        result_msg
+    }
+
+    /// Threshold check: returns Some(reason) when auto-compaction should
+    /// trigger because cumulative tokens are nearing the configured cap.
+    /// Used by long-running agent loops to keep context fresh without
+    /// requiring the user to manually `/compact`.
+    pub fn auto_compact_recommendation(&self, threshold_input_tokens: usize) -> Option<String> {
+        if threshold_input_tokens == 0 {
+            return None;
+        }
+        if self.cumulative_input_tokens >= threshold_input_tokens {
+            Some(format!(
+                "input tokens {} >= threshold {}",
+                self.cumulative_input_tokens, threshold_input_tokens
+            ))
+        } else {
+            None
+        }
     }
 
     pub fn clear(&mut self) {
