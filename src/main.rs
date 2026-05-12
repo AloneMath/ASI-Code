@@ -10920,6 +10920,72 @@ pub(crate) fn looks_like_pending_action_promise(text: &str) -> bool {
         return true;
     }
 
+    // Chinese-language promise / hand-off phrasings. Source kept ASCII via
+    // \u{...} escapes so no CJK literals appear in code. Group A is the
+    // "I will execute" promise pattern (model says it will run something
+    // but does not emit a tool call). Group B is the "you should run it"
+    // hand-off pattern (model pushes execution back to the user).
+    //
+    // To add a new pattern: take the Chinese phrase, encode each CJK char
+    // as \u{HEX}, leave ASCII as-is, and place the literal here. The
+    // matching is byte-equality against the model's raw text, so the
+    // resulting UTF-8 sequence must be exactly what the model emits.
+    let cjk_promise_markers = [
+        // Group A: explicit "I will run / I am about to do X" promises.
+        "\u{6211}\u{73B0}\u{5728}\u{5C31}\u{76F4}\u{63A5}\u{8FD0}\u{884C}",
+        "\u{6211}\u{73B0}\u{5728}\u{5C31}\u{8FD0}\u{884C}",
+        "\u{6211}\u{4F1A}\u{76F4}\u{63A5}\u{8FD0}\u{884C}",
+        "\u{6211}\u{4F1A}\u{9A6C}\u{4E0A}\u{8FD0}\u{884C}",
+        "\u{6211}\u{4F1A}\u{7ACB}\u{5373}\u{8FD0}\u{884C}",
+        "\u{6211}\u{63A5}\u{4E0B}\u{6765}\u{4F1A}",
+        "\u{6211}\u{63A5}\u{4E0B}\u{6765}\u{8981}",
+        "\u{6211}\u{4E0B}\u{4E00}\u{6B65}\u{4F1A}",
+        "\u{6211}\u{4E0B}\u{4E00}\u{6B65}\u{5C06}",
+        "\u{7A0D}\u{540E}\u{6211}",
+        "\u{7A0D}\u{540E}\u{4F1A}",
+        "\u{8FD0}\u{884C}\u{540E}\u{628A}\u{7ED3}\u{679C}\u{56DE}\u{7ED9}\u{4F60}",
+        "\u{8FD0}\u{884C}\u{540E}\u{56DE}\u{62A5}",
+        "\u{8FD0}\u{884C}\u{540E}\u{544A}\u{8BC9}\u{4F60}",
+        // Group B: hand-off to user — model asks user to run it instead.
+        "\u{8BF7}\u{5728}\u{4F60}\u{672C}\u{5730}\u{7EC8}\u{7AEF}\u{8FD0}\u{884C}",
+        "\u{8BF7}\u{5728}\u{672C}\u{5730}\u{7EC8}\u{7AEF}\u{8FD0}\u{884C}",
+        "\u{8BF7}\u{4F60}\u{81EA}\u{5DF1}\u{6267}\u{884C}",
+        "\u{8BF7}\u{4F60}\u{81EA}\u{5DF1}\u{8FD0}\u{884C}",
+        "\u{8BF7}\u{4F60}\u{624B}\u{52A8}\u{8FD0}\u{884C}",
+        "\u{8BF7}\u{4F60}\u{624B}\u{52A8}\u{6267}\u{884C}",
+        "\u{8BF7}\u{4F60}\u{6267}\u{884C}\u{4E0B}\u{9762}",
+        "\u{8BF7}\u{4F60}\u{6267}\u{884C}\u{4E0B}\u{9762}\u{8FD9}\u{6761}",
+        "\u{4F60}\u{672C}\u{5730}\u{624B}\u{52A8}\u{8FD0}\u{884C}\u{5373}\u{53EF}",
+        "\u{4F60}\u{53EF}\u{4EE5}\u{624B}\u{52A8}\u{8FD0}\u{884C}",
+        "\u{4F60}\u{76F4}\u{63A5}\u{8FD0}\u{884C}\u{5373}\u{53EF}",
+        "\u{4F60}\u{53EF}\u{4EE5}\u{76F4}\u{63A5}\u{8FD0}\u{884C}",
+        "\u{8BF7}\u{540C}\u{610F}\u{6211}",
+        "\u{5982}\u{540C}\u{610F}",
+        "\u{5982}\u{4F60}\u{540C}\u{610F}",
+        "\u{5982}\u{679C}\u{4F60}\u{540C}\u{610F}",
+        "\u{5982}\u{679C}\u{4F60}\u{5141}\u{8BB8}",
+        "\u{5982}\u{5141}\u{8BB8}",
+        "\u{8BF7}\u{5141}\u{8BB8}\u{6211}",
+        "\u{5982}\u{679C}\u{4F60}\u{8981}\u{6211}\u{7EE7}\u{7EED}",
+        "\u{5982}\u{679C}\u{4F60}\u{9700}\u{8981}\u{6211}\u{7EE7}\u{7EED}",
+        "\u{6211}\u{53EF}\u{4EE5}\u{73B0}\u{5728}\u{5C31}",
+        "\u{6211}\u{53EF}\u{4EE5}\u{76F4}\u{63A5}",
+        "\u{6211}\u{53EF}\u{4EE5}\u{9A6C}\u{4E0A}",
+        "\u{4F60}\u{53EA}\u{9700}",
+        "\u{8BF7}\u{4F60}\u{6309}",
+        "\u{8BF7}\u{4F60}\u{6309}\u{4E0B}\u{9762}",
+        "\u{6211}\u{4F1A}\u{5148}",
+        "\u{6211}\u{5148}",
+        "\u{4E0B}\u{4E00}\u{6B65}\u{6211}\u{4F1A}",
+        "\u{4E0B}\u{4E00}\u{6B65}\u{6211}\u{5C06}",
+        "\u{6211}\u{9700}\u{8981}\u{4F60}\u{786E}\u{8BA4}",
+        "\u{9700}\u{8981}\u{4F60}\u{7684}\u{786E}\u{8BA4}",
+        "\u{786E}\u{8BA4}\u{540E}\u{6211}\u{4F1A}",
+    ];
+    if cjk_promise_markers.iter().any(|m| text.contains(m)) {
+        return true;
+    }
+
     false
 }
 
@@ -13766,9 +13832,32 @@ fn is_coding_intent(input: &str) -> bool {
 
     let compact_len = trimmed.chars().filter(|c| !c.is_whitespace()).count();
     if compact_len <= 20 && contains_cjk_script(trimmed) {
+        // Short CJK / English greetings that should NOT be treated as a
+        // workspace task. CJK literals encoded as \u{...} to keep the
+        // source file ASCII-only. Glosses:
+        //   \u{4F60}\u{597D}                      = "hi" (informal)
+        //   \u{60A8}\u{597D}                      = "hi" (formal)
+        //   \u{4F60}\u{5728}\u{5417}              = "are you there"
+        //   \u{5728}\u{5417}                      = "(you) there"
+        //   \u{55E8}                              = "hey"
+        //   \u{54C8}\u{55BD}                      = "hello"
+        //   \u{8C22}\u{8C22}                      = "thanks"
+        //   \u{4F60}\u{80FD}\u{505A}\u{4EC0}\u{4E48} = "what can you do"
+        //   \u{4F60}\u{4F1A}\u{4EC0}\u{4E48}       = "what do you know"
         let tiny_non_task = [
-            "你好", "您好", "你在吗", "在吗", "嗨", "哈喽", "hello", "hi", "hey", "thanks", "谢谢",
-            "你能做什么", "你会什么",
+            "\u{4F60}\u{597D}",
+            "\u{60A8}\u{597D}",
+            "\u{4F60}\u{5728}\u{5417}",
+            "\u{5728}\u{5417}",
+            "\u{55E8}",
+            "\u{54C8}\u{55BD}",
+            "hello",
+            "hi",
+            "hey",
+            "thanks",
+            "\u{8C22}\u{8C22}",
+            "\u{4F60}\u{80FD}\u{505A}\u{4EC0}\u{4E48}",
+            "\u{4F60}\u{4F1A}\u{4EC0}\u{4E48}",
         ];
         if tiny_non_task
             .iter()
@@ -15122,14 +15211,20 @@ fn help_topic_examples_from_text(text: &str, max_items: usize) -> Vec<String> {
 
 fn checkpoint_auto_save_hint(error: &str) -> &'static str {
     let lower = error.to_ascii_lowercase();
+    // CJK localized Windows error strings are matched as ASCII-encoded
+    // \u{...} literals so the source stays free of literal CJK chars.
+    //   \u{627E}\u{4E0D}\u{5230}   = "not found" (zh-Hans)
+    //   \u{62D2}\u{7EDD}\u{8BBF}\u{95EE} = "access denied" (zh-Hans)
+    let cjk_not_found = "\u{627E}\u{4E0D}\u{5230}";
+    let cjk_access_denied = "\u{62D2}\u{7EDD}\u{8BBF}\u{95EE}";
     if lower.contains("os error 3")
         || lower.contains("not found")
-        || lower.contains("找不到")
+        || error.contains(cjk_not_found)
     {
         "hint: checkpoint directory was missing; ensure project path exists and is writable."
     } else if lower.contains("os error 5")
         || lower.contains("permission")
-        || lower.contains("拒绝访问")
+        || error.contains(cjk_access_denied)
     {
         "hint: checkpoint write permission denied; check directory ACL/locks."
     } else {
@@ -16760,10 +16855,20 @@ mod prompt_and_validation_tests {
 
     #[test]
     fn checkpoint_auto_save_hint_classifies_common_errors() {
-        let missing = super::checkpoint_auto_save_hint("系统找不到指定的路径。 (os error 3)");
+        // Localized Windows error fixtures expressed via \u{...} so the
+        // source contains no literal CJK characters.
+        //   "\u{7CFB}\u{7EDF}\u{627E}\u{4E0D}\u{5230}\u{6307}\u{5B9A}\u{7684}\u{8DEF}\u{5F84}\u{3002}"
+        //     = "the system cannot find the specified path."
+        //   "\u{62D2}\u{7EDD}\u{8BBF}\u{95EE}\u{3002}"
+        //     = "access denied."
+        let missing = super::checkpoint_auto_save_hint(
+            "\u{7CFB}\u{7EDF}\u{627E}\u{4E0D}\u{5230}\u{6307}\u{5B9A}\u{7684}\u{8DEF}\u{5F84}\u{3002} (os error 3)",
+        );
         assert!(missing.contains("missing"));
 
-        let denied = super::checkpoint_auto_save_hint("拒绝访问。 (os error 5)");
+        let denied = super::checkpoint_auto_save_hint(
+            "\u{62D2}\u{7EDD}\u{8BBF}\u{95EE}\u{3002} (os error 5)",
+        );
         assert!(denied.contains("permission"));
 
         let generic = super::checkpoint_auto_save_hint("unexpected write failure");
@@ -21145,6 +21250,48 @@ mod prompt_and_validation_tests {
         )
         .expect("path");
         assert_eq!(got, r"D:\test-cli\src\calcplus\core.py");
+    }
+
+    #[test]
+    fn pending_action_promise_catches_cjk_handoff() {
+        // gpt-5.3-codex via third-party gateways punts back to the user
+        // with a CJK "please run it in your terminal" message instead of
+        // calling bash. Phrase: "please run it in your local terminal".
+        let text = "\u{8BF7}\u{5728}\u{4F60}\u{672C}\u{5730}\u{7EC8}\u{7AEF}\u{8FD0}\u{884C} the command yourself";
+        assert!(
+            super::looks_like_pending_action_promise(text),
+            "CJK handoff to user should trigger pending-action nudge"
+        );
+    }
+
+    #[test]
+    fn pending_action_promise_catches_cjk_promise_to_run() {
+        // Phrase: "I will run it right now"
+        let text = "Ok, \u{6211}\u{73B0}\u{5728}\u{5C31}\u{76F4}\u{63A5}\u{8FD0}\u{884C} it.";
+        assert!(
+            super::looks_like_pending_action_promise(text),
+            "CJK 'I will run now' should trigger pending-action nudge"
+        );
+    }
+
+    #[test]
+    fn pending_action_promise_catches_cjk_ask_permission() {
+        // Phrase: "if you agree"
+        let text = "\u{5982}\u{679C}\u{4F60}\u{540C}\u{610F}, I will then proceed.";
+        assert!(
+            super::looks_like_pending_action_promise(text),
+            "CJK 'if you agree' should trigger pending-action nudge"
+        );
+    }
+
+    #[test]
+    fn pending_action_promise_does_not_false_match_cjk_prose() {
+        // Innocent CJK prose with no promise / no hand-off pattern.
+        let text = "Fibonacci \u{6570}\u{5217}\u{7684}\u{4E0B}\u{4E00}\u{9879} is the sum of the previous two.";
+        assert!(
+            !super::looks_like_pending_action_promise(text),
+            "Innocent CJK prose must not match"
+        );
     }
 
     #[test]
