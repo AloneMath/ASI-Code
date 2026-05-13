@@ -1,14 +1,24 @@
 use glob::glob;
 use regex::Regex;
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const BRIDGE_TIMEOUT_SECS_DEFAULT: u64 = 120;
+const BRIDGE_TIMEOUT_SECS_MAX: u64 = 3600;
+
+#[derive(Debug, Clone, Deserialize)]
+struct BridgeRequest {
+    script: String,
+    #[serde(default)]
+    project: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolResult {
@@ -178,6 +188,68 @@ pub fn run_tool(name: &str, args: &str) -> ToolResult {
                 .unwrap_or_else(|| normalize_bash_args(args));
             bash(&cmd)
         }
+        "screenshot" => screenshot(),
+        "find_window" => {
+            let title = extract_json_string_arg(
+                args.trim(),
+                &["title", "query", "window_title", "windowTitle", "name"],
+            )
+            .or_else(|| {
+                extract_key_value_string_arg(
+                    args.trim(),
+                    &["title", "query", "window_title", "windowTitle", "name"],
+                )
+            })
+            .unwrap_or_else(|| strip_surrounding_quotes(args.trim()).to_string());
+            find_window(&title)
+        }
+        "click" | "mouse_click" => {
+            let text = extract_json_string_arg(args.trim(), &["text", "label", "name", "button"])
+                .or_else(|| {
+                    extract_key_value_string_arg(
+                        args.trim(),
+                        &["text", "label", "name", "button"],
+                    )
+                });
+            if let Some(label) = text {
+                click_text(&label)
+            } else {
+                let x = extract_json_i32_arg(args.trim(), &["x"])
+                    .or_else(|| extract_key_value_i32_arg(args.trim(), &["x"]));
+                let y = extract_json_i32_arg(args.trim(), &["y"])
+                    .or_else(|| extract_key_value_i32_arg(args.trim(), &["y"]));
+                match (x, y) {
+                    (Some(px), Some(py)) => mouse_click(px, py),
+                    _ => match parse_click_xy_args(args.trim()) {
+                        Some((px, py)) => mouse_click(px, py),
+                        None => ToolResult::err(
+                            "click requires either coordinates (`x y`) or a text label (`text=\"Save\"`)",
+                        ),
+                    },
+                }
+            }
+        }
+        "click_text" => {
+            let text = extract_json_string_arg(args.trim(), &["text", "label", "name", "button"])
+                .or_else(|| {
+                    extract_key_value_string_arg(
+                        args.trim(),
+                        &["text", "label", "name", "button"],
+                    )
+                })
+                .unwrap_or_else(|| strip_surrounding_quotes(args.trim()).to_string());
+            click_text(&text)
+        }
+        "type" | "type_text" => {
+            let text = extract_json_string_arg(args.trim(), &["text", "content", "input"])
+                .or_else(|| extract_key_value_string_arg(args.trim(), &["text", "content", "input"]))
+                .unwrap_or_else(|| strip_surrounding_quotes(args.trim()).to_string());
+            type_text(&text)
+        }
+        "read_screen_text" => read_screen_text(),
+        "ue5_bridge" => ue5_bridge(args),
+        "blender_bridge" => blender_bridge(args),
+        "unity_bridge" => unity_bridge(args),
         _ => ToolResult::err(format!("Unknown tool: {}", name)),
     }
 }
@@ -221,6 +293,30 @@ fn extract_json_usize_arg(raw: &str, keys: &[&str]) -> Option<usize> {
     None
 }
 
+fn extract_json_i32_arg(raw: &str, keys: &[&str]) -> Option<i32> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = parsed.as_object()?;
+    for key in keys {
+        if let Some(v) = obj.get(*key) {
+            if let Some(n) = v.as_i64() {
+                if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+                    return Some(n as i32);
+                }
+            }
+            if let Some(s) = v.as_str() {
+                if let Ok(parsed) = s.parse::<i32>() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn extract_key_value_string_arg(raw: &str, keys: &[&str]) -> Option<String> {
     let pairs = parse_key_value_args(raw)?;
     for key in keys {
@@ -238,6 +334,13 @@ fn extract_key_value_usize_arg(raw: &str, keys: &[&str]) -> Option<usize> {
     extract_key_value_string_arg(raw, keys)?
         .trim()
         .parse::<usize>()
+        .ok()
+}
+
+fn extract_key_value_i32_arg(raw: &str, keys: &[&str]) -> Option<i32> {
+    extract_key_value_string_arg(raw, keys)?
+        .trim()
+        .parse::<i32>()
         .ok()
 }
 
@@ -1975,6 +2078,503 @@ fn simple_url_encode(text: &str) -> String {
     out
 }
 
+fn parse_click_xy_args(args: &str) -> Option<(i32, i32)> {
+    let trimmed = strip_surrounding_quotes(args.trim());
+    let mut it = trimmed.split_whitespace();
+    let x = it.next()?.parse::<i32>().ok()?;
+    let y = it.next()?.parse::<i32>().ok()?;
+    Some((x, y))
+}
+
+fn powershell_escape_single_quoted(input: &str) -> String {
+    input.replace('\'', "''")
+}
+
+fn run_windows_gui_powershell(script: &str) -> ToolResult {
+    if !cfg!(target_os = "windows") {
+        return ToolResult::err("computer-control tools are currently supported on Windows only");
+    }
+
+    let mut cmd = Command::new("powershell");
+    cmd.arg("-NoProfile")
+        .arg("-Command")
+        .arg(with_windows_utf8_preamble(script))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = match cmd.output() {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(format!("failed to run powershell: {}", e)),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut merged = String::new();
+    if !stdout.is_empty() {
+        merged.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(&stderr);
+    }
+    if merged.is_empty() {
+        merged = format!("exit={}", output.status.code().unwrap_or(-1));
+    }
+
+    ToolResult {
+        ok: output.status.success(),
+        output: merged,
+    }
+}
+
+pub fn screenshot() -> ToolResult {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bmp.Size)
+$ms = New-Object System.IO.MemoryStream
+$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$bytes = $ms.ToArray()
+$b64 = [System.Convert]::ToBase64String($bytes)
+$g.Dispose()
+$bmp.Dispose()
+$ms.Dispose()
+
+$obj = [ordered]@{
+  format = "png"
+  width = $bounds.Width
+  height = $bounds.Height
+  left = $bounds.Left
+  top = $bounds.Top
+  image_base64 = $b64
+}
+$obj | ConvertTo-Json -Compress -Depth 4
+"#;
+    run_windows_gui_powershell(script)
+}
+
+pub fn find_window(title: &str) -> ToolResult {
+    let esc_title = powershell_escape_single_quoted(title);
+    let script = format!(
+        r#"
+$query = '{query}'
+$procs = Get-Process | Where-Object {{ $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle }}
+if ($query) {{
+  $procs = $procs | Where-Object {{ $_.MainWindowTitle -like "*$query*" }}
+}}
+$rows = $procs | Select-Object Id, ProcessName, MainWindowTitle, MainWindowHandle
+$obj = [ordered]@{{
+  query = $query
+  count = @($rows).Count
+  windows = @($rows | ForEach-Object {{
+    [ordered]@{{
+      pid = $_.Id
+      process = $_.ProcessName
+      title = $_.MainWindowTitle
+      handle = $_.MainWindowHandle
+    }}
+  }})
+}}
+$obj | ConvertTo-Json -Compress -Depth 5
+"#,
+        query = esc_title
+    );
+    run_windows_gui_powershell(&script)
+}
+
+pub fn mouse_click(x: i32, y: i32) -> ToolResult {
+    let script = format!(
+        r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinMouse {{
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
+}}
+"@
+
+[WinMouse]::SetCursorPos({x}, {y}) | Out-Null
+[WinMouse]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero) # left down
+[WinMouse]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero) # left up
+
+[ordered]@{{ x = {x}; y = {y}; clicked = $true }} | ConvertTo-Json -Compress
+"#,
+        x = x,
+        y = y
+    );
+    run_windows_gui_powershell(&script)
+}
+
+pub fn click_text(text: &str) -> ToolResult {
+    if text.trim().is_empty() {
+        return ToolResult::err("click_text requires a non-empty text label");
+    }
+    let esc = powershell_escape_single_quoted(text.trim());
+    let script = format!(
+        r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+$label = '{label}'
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = New-Object System.Windows.Automation.AndCondition(
+  (New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NameProperty, $label
+  )),
+  (New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::IsEnabledProperty, $true
+  ))
+)
+$node = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+if ($null -eq $node) {{
+  throw "No enabled UI element found with exact name: $label"
+}}
+
+$inv = $node.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+if ($null -eq $inv) {{
+  throw "Element found but does not support InvokePattern: $label"
+}}
+[System.Windows.Automation.InvokePattern]$inv | ForEach-Object {{ $_.Invoke() }}
+
+[ordered]@{{ text = $label; clicked = $true }} | ConvertTo-Json -Compress
+"#,
+        label = esc
+    );
+    run_windows_gui_powershell(&script)
+}
+
+pub fn type_text(text: &str) -> ToolResult {
+    if text.is_empty() {
+        return ToolResult::err("type_text requires non-empty text");
+    }
+    let esc = powershell_escape_single_quoted(text);
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Windows.Forms
+
+$text = '{text}'
+[System.Windows.Forms.SendKeys]::SendWait($text)
+
+[ordered]@{{ typed = $true; length = $text.Length }} | ConvertTo-Json -Compress
+"#,
+        text = esc
+    );
+    run_windows_gui_powershell(&script)
+}
+
+pub fn read_screen_text() -> ToolResult {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$tmpPng = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ("asi_ocr_" + [System.Guid]::NewGuid().ToString("N") + ".png"))
+
+$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bmp.Size)
+$bmp.Save($tmpPng, [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose()
+$bmp.Dispose()
+
+$tesseract = Get-Command tesseract -ErrorAction SilentlyContinue
+if ($null -eq $tesseract) {
+  Remove-Item -LiteralPath $tmpPng -Force -ErrorAction SilentlyContinue
+  throw "tesseract not found in PATH; install Tesseract OCR to enable read_screen_text"
+}
+
+$ocr = & tesseract $tmpPng stdout 2>$null
+$text = ($ocr | Out-String).Trim()
+
+Remove-Item -LiteralPath $tmpPng -Force -ErrorAction SilentlyContinue
+
+$obj = [ordered]@{
+  text = $text
+  length = $text.Length
+}
+$obj | ConvertTo-Json -Compress -Depth 4
+"#;
+    run_windows_gui_powershell(script)
+}
+
+fn parse_bridge_request(args: &str) -> Result<BridgeRequest, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err("bridge call requires JSON args with `script`".to_string());
+    }
+
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let parsed: BridgeRequest =
+            serde_json::from_str(trimmed).map_err(|e| format!("invalid bridge JSON args: {}", e))?;
+        if parsed.script.trim().is_empty() {
+            return Err("bridge `script` cannot be empty".to_string());
+        }
+        return Ok(parsed);
+    }
+
+    let script = strip_surrounding_quotes(trimmed).to_string();
+    if script.trim().is_empty() {
+        return Err("bridge script cannot be empty".to_string());
+    }
+    Ok(BridgeRequest {
+        script,
+        project: String::new(),
+    })
+}
+
+fn bridge_timeout_secs() -> u64 {
+    std::env::var("ASI_BRIDGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(1, BRIDGE_TIMEOUT_SECS_MAX))
+        .unwrap_or(BRIDGE_TIMEOUT_SECS_DEFAULT)
+}
+
+fn unique_bridge_file(engine: &str, ext: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pid = std::process::id();
+    p.push(format!("asi_{}_{}_{}.{}", engine, pid, ts, ext));
+    p
+}
+
+fn finalize_bridge_result(tool_name: &str, ok: bool, output: String) -> ToolResult {
+    let payload = serde_json::json!({
+        "tool": tool_name,
+        "ok": ok,
+        "output": output
+    });
+    ToolResult {
+        ok,
+        output: payload.to_string(),
+    }
+}
+
+fn run_bridge_command(
+    tool_name: &str,
+    mut cmd: Command,
+    timeout_secs: u64,
+) -> ToolResult {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return finalize_bridge_result(tool_name, false, format!("failed to spawn bridge process: {}", e)),
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+
+    let out_tx = tx.clone();
+    let out_handle = thread::spawn(move || {
+        if let Some(out) = stdout {
+            let reader = BufReader::new(out);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = out_tx.send((true, line));
+            }
+        }
+    });
+
+    let err_tx = tx.clone();
+    let err_handle = thread::spawn(move || {
+        if let Some(err) = stderr {
+            let reader = BufReader::new(err);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = err_tx.send((false, line));
+            }
+        }
+    });
+    drop(tx);
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs.clamp(1, BRIDGE_TIMEOUT_SECS_MAX));
+    let mut status_code = -1;
+    let mut timed_out = false;
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut err_lines: Vec<String> = Vec::new();
+
+    loop {
+        while let Ok((is_stdout, line)) = rx.try_recv() {
+            if is_stdout {
+                out_lines.push(line);
+            } else {
+                err_lines.push(line);
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                status_code = status.code().unwrap_or(-1);
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(e) => {
+                return finalize_bridge_result(
+                    tool_name,
+                    false,
+                    format!("bridge process wait error: {}", e),
+                )
+            }
+        }
+    }
+
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+    while let Ok((is_stdout, line)) = rx.try_recv() {
+        if is_stdout {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+
+    let mut merged = String::new();
+    if !out_lines.is_empty() {
+        merged.push_str(&out_lines.join("\n"));
+    }
+    if !err_lines.is_empty() {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(&err_lines.join("\n"));
+    }
+    if timed_out {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(&format!(
+            "bridge process timed out after {}s",
+            timeout.as_secs()
+        ));
+    }
+    if merged.is_empty() {
+        merged = format!("exit={}", status_code);
+    }
+
+    finalize_bridge_result(tool_name, status_code == 0 && !timed_out, merged)
+}
+
+pub fn ue5_bridge(args: &str) -> ToolResult {
+    let req = match parse_bridge_request(args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let script_file = unique_bridge_file("ue5", "py");
+    if let Err(e) = fs::write(&script_file, req.script) {
+        return finalize_bridge_result(
+            "ue5_bridge",
+            false,
+            format!("failed to write temporary UE5 script file: {}", e),
+        );
+    }
+
+    let editor = std::env::var("ASI_UE5_EDITOR")
+        .or_else(|_| std::env::var("UE5_EDITOR"))
+        .unwrap_or_else(|_| "UnrealEditor-Cmd.exe".to_string());
+    let mut cmd = Command::new(editor);
+    if !req.project.trim().is_empty() {
+        cmd.arg(req.project.trim());
+    }
+    cmd.arg("-Unattended")
+        .arg("-NoSplash")
+        .arg("-NoSound")
+        .arg("-NullRHI")
+        .arg(format!(
+            "-ExecutePythonScript={}",
+            script_file.to_string_lossy()
+        ));
+
+    let res = run_bridge_command("ue5_bridge", cmd, bridge_timeout_secs());
+    let _ = fs::remove_file(&script_file);
+    res
+}
+
+pub fn blender_bridge(args: &str) -> ToolResult {
+    let req = match parse_bridge_request(args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let script_file = unique_bridge_file("blender", "py");
+    if let Err(e) = fs::write(&script_file, req.script) {
+        return finalize_bridge_result(
+            "blender_bridge",
+            false,
+            format!("failed to write temporary Blender script file: {}", e),
+        );
+    }
+
+    let blender_bin = std::env::var("ASI_BLENDER_BIN")
+        .or_else(|_| std::env::var("BLENDER_BIN"))
+        .unwrap_or_else(|_| "blender".to_string());
+    let mut cmd = Command::new(blender_bin);
+    cmd.arg("--background")
+        .arg("--python")
+        .arg(script_file.to_string_lossy().to_string());
+
+    let res = run_bridge_command("blender_bridge", cmd, bridge_timeout_secs());
+    let _ = fs::remove_file(&script_file);
+    res
+}
+
+pub fn unity_bridge(args: &str) -> ToolResult {
+    let req = match parse_bridge_request(args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let project = req.project.trim();
+    if project.is_empty() {
+        return finalize_bridge_result(
+            "unity_bridge",
+            false,
+            "unity_bridge requires `project` in args JSON".to_string(),
+        );
+    }
+    let script_file = unique_bridge_file("unity", "py");
+    if let Err(e) = fs::write(&script_file, req.script) {
+        return finalize_bridge_result(
+            "unity_bridge",
+            false,
+            format!("failed to write temporary Unity Python script file: {}", e),
+        );
+    }
+
+    let unity_bin = std::env::var("ASI_UNITY_EDITOR")
+        .or_else(|_| std::env::var("UNITY_EDITOR"))
+        .unwrap_or_else(|_| "Unity".to_string());
+    let mut cmd = Command::new(unity_bin);
+    cmd.arg("-batchmode")
+        .arg("-nographics")
+        .arg("-quit")
+        .arg("-projectPath")
+        .arg(project)
+        .arg("-executeMethod")
+        .arg("PythonRunner.RunFile")
+        .arg("-pythonFile")
+        .arg(script_file.to_string_lossy().to_string());
+
+    let res = run_bridge_command("unity_bridge", cmd, bridge_timeout_secs());
+    let _ = fs::remove_file(&script_file);
+    res
+}
+
 pub fn bash(command: &str) -> ToolResult {
     let timeout_secs = std::env::var("ASI_BASH_TIMEOUT_SECS")
         .ok()
@@ -2333,6 +2933,15 @@ pub fn tool_index() -> String {
         "- web_search <query>",
         "- web_fetch <url>",
         "- bash <command>",
+        "- screenshot",
+        "- find_window <title>",
+        "- click <x> <y>",
+        "- click_text <text>",
+        "- type <text>",
+        "- read_screen_text",
+        "- ue5_bridge <json:{script,project?}>",
+        "- blender_bridge <json:{script,project?}>",
+        "- unity_bridge <json:{script,project}>",
     ]
     .join("\n")
 }
@@ -2344,7 +2953,7 @@ mod tests {
         grep_search,
         decode_key_value_text_value,
         normalize_bash_args, normalize_grep_search_args, normalize_windows_shell_command,
-        extract_key_value_string_arg,
+        extract_key_value_string_arg, parse_click_xy_args,
         rewrite_python_dash_c_single_quoted_script, rewrite_python_herestring_for_powershell,
         rewrite_bash_group_pipe_python_for_powershell,
         run_tool,
@@ -2362,6 +2971,86 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // End-to-end smoke test for the engine bridges. We can't assume the
+    // user has UE5 / Blender / Unity installed (they're huge), so we spawn
+    // a tiny Python "fake engine" that mimics the `--python <file>` CLI
+    // contract Blender uses. This validates the full pipeline:
+    //   parse JSON args -> write temp .py -> spawn subprocess
+    //   -> capture stdout -> clean up -> structured result back.
+    //
+    // The test is windows-gated only because the wrapper uses `.cmd` for
+    // a portable way to invoke `python` regardless of where it lives on
+    // PATH. The same shape works on Unix with a `.sh` wrapper.
+    // Gated behind ASI_RUN_BRIDGE_E2E=1 because it mutates ASI_BLENDER_BIN
+    // in-process; if cargo test runs in parallel (default), other tests
+    // reading that env var can race. Run explicitly:
+    //   $env:ASI_RUN_BRIDGE_E2E="1"; cargo test --release --bin asi blender_bridge_runs_user_python -- --test-threads=1
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn blender_bridge_runs_user_python_via_fake_engine_wrapper() {
+        if env::var("ASI_RUN_BRIDGE_E2E").ok().as_deref() != Some("1") {
+            eprintln!(
+                "skipping: set ASI_RUN_BRIDGE_E2E=1 to run the bridge end-to-end smoke test"
+            );
+            return;
+        }
+        let tmp = env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0);
+        let wrapper_cmd = tmp.join(format!("asi_fake_blender_{}.cmd", ts));
+        let wrapper_py = tmp.join(format!("asi_fake_blender_{}.py", ts));
+
+        // Minimal Python stand-in for `blender --background --python X`.
+        // Asi-code calls: <bin> --background --python <tempfile>
+        let py_body = r#"
+import os, runpy, sys
+argv = sys.argv[1:]
+if "--python" not in argv:
+    print("fake_blender: missing --python", file=sys.stderr)
+    raise SystemExit(2)
+i = argv.index("--python")
+script = argv[i + 1]
+if not os.path.exists(script):
+    print("fake_blender: missing script", file=sys.stderr)
+    raise SystemExit(2)
+runpy.run_path(script, run_name="__bridge__")
+"#;
+        fs::write(&wrapper_py, py_body).expect("write wrapper py");
+
+        // Windows .cmd that forwards args verbatim to python and the .py.
+        let cmd_body = format!(
+            "@echo off\r\npython \"{}\" %*\r\n",
+            wrapper_py.display()
+        );
+        fs::write(&wrapper_cmd, cmd_body).expect("write wrapper cmd");
+
+        // Wire the bridge to our wrapper and call run_tool just like the
+        // production agent loop would.
+        env::set_var("ASI_BLENDER_BIN", wrapper_cmd.to_string_lossy().to_string());
+        let result = run_tool(
+            "blender_bridge",
+            r#"{"script":"print('BRIDGE_MARKER_HELLO')"}"#,
+        );
+
+        // Clean up wrappers regardless of outcome.
+        let _ = fs::remove_file(&wrapper_py);
+        let _ = fs::remove_file(&wrapper_cmd);
+        env::remove_var("ASI_BLENDER_BIN");
+
+        assert!(
+            result.ok,
+            "blender_bridge end-to-end pipeline should succeed, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("BRIDGE_MARKER_HELLO"),
+            "bridge stdout should include the script's print output, got: {}",
+            result.output
+        );
+    }
 
     #[test]
     fn parse_delimited_write_supports_eof_marker() {
@@ -2479,6 +3168,13 @@ mod tests {
     fn decode_key_value_text_value_decodes_common_escapes() {
         let got = decode_key_value_text_value(r#"line1\nline2\tok\\done"#);
         assert_eq!(got, "line1\nline2\tok\\done");
+    }
+
+    #[test]
+    fn parse_click_xy_args_supports_plain_and_quoted_forms() {
+        assert_eq!(parse_click_xy_args("100 200"), Some((100, 200)));
+        assert_eq!(parse_click_xy_args("\"300 400\""), Some((300, 400)));
+        assert_eq!(parse_click_xy_args("x=1 y=2"), None);
     }
 
     #[test]

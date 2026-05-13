@@ -45,6 +45,42 @@ pub(crate) fn dispatch(command: crate::Command) -> Result<(), String> {
             println!("{}", msg);
             Ok(())
         }
+        crate::Command::Ue5 {
+            script,
+            script_file,
+            project,
+        } => {
+            let req = crate::resolve_bridge_script_request(script, script_file, project)?;
+            let payload = serde_json::json!({
+                "script": req.script,
+                "project": req.project.unwrap_or_default()
+            });
+            crate::run_bridge_tool("ue5_bridge", payload)
+        }
+        crate::Command::Blender {
+            script,
+            script_file,
+            project,
+        } => {
+            let req = crate::resolve_bridge_script_request(script, script_file, project)?;
+            let payload = serde_json::json!({
+                "script": req.script,
+                "project": req.project.unwrap_or_default()
+            });
+            crate::run_bridge_tool("blender_bridge", payload)
+        }
+        crate::Command::Unity {
+            script,
+            script_file,
+            project,
+        } => {
+            let req = crate::resolve_bridge_script_request(script, script_file, Some(project))?;
+            let payload = serde_json::json!({
+                "script": req.script,
+                "project": req.project.unwrap_or_default()
+            });
+            crate::run_bridge_tool("unity_bridge", payload)
+        }
         crate::Command::Config {
             provider,
             model,

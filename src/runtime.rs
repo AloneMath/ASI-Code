@@ -2313,7 +2313,20 @@ pub fn collect_hook_diagnostics(event: &str, tool: &str, args: &str, mode: &str)
 }
 
 fn tool_requires_user_confirmation(tool: &str) -> bool {
-    matches!(tool, "bash" | "write_file" | "edit_file")
+    matches!(
+        tool,
+        "bash"
+            | "write_file"
+            | "edit_file"
+            | "click"
+            | "mouse_click"
+            | "click_text"
+            | "type"
+            | "type_text"
+            | "ue5_bridge"
+            | "blender_bridge"
+            | "unity_bridge"
+    )
 }
 
 fn tool_args_preview(args: &str, max_chars: usize) -> String {
@@ -2497,6 +2510,17 @@ fn score_auto_review_risk(tool: &str, args: &str) -> (AutoReviewSeverity, String
         "write_file" | "edit_file" => (
             AutoReviewSeverity::Medium,
             "file mutation requested".to_string(),
+        ),
+        "click"
+        | "mouse_click"
+        | "click_text"
+        | "type"
+        | "type_text"
+        | "ue5_bridge"
+        | "blender_bridge"
+        | "unity_bridge" => (
+            AutoReviewSeverity::High,
+            "desktop input control requested".to_string(),
         ),
         "web_fetch" => (
             AutoReviewSeverity::Low,
@@ -2830,6 +2854,17 @@ fn is_known_tool(name: &str) -> bool {
             | "web_search"
             | "web_fetch"
             | "bash"
+            | "screenshot"
+            | "find_window"
+            | "click"
+            | "mouse_click"
+            | "click_text"
+            | "type"
+            | "type_text"
+            | "read_screen_text"
+            | "ue5_bridge"
+            | "blender_bridge"
+            | "unity_bridge"
     )
 }
 fn compact_tool_result_for_history(tool: &str, text: &str) -> String {
@@ -3042,7 +3077,17 @@ fn normalize_tool_args(name: &str, args: &str) -> String {
                 format!("{} {}", first, rest.trim())
             }
         }
-        "glob_search" | "web_search" | "web_fetch" | "bash" => {
+        "glob_search"
+        | "web_search"
+        | "web_fetch"
+        | "bash"
+        | "find_window"
+        | "click_text"
+        | "type"
+        | "type_text"
+        | "ue5_bridge"
+        | "blender_bridge"
+        | "unity_bridge" => {
             let sanitized = strip_accidental_trailing_closing_parens(trimmed);
             strip_surrounding_quotes(&sanitized).to_string()
         }
@@ -3241,8 +3286,25 @@ fn deny_reason(
 
     let lvl = level(mode);
     let required = match tool {
-        "read_file" | "glob_search" | "grep_search" | "web_search" | "web_fetch" => 0,
-        "write_file" | "edit_file" | "bash" => 1,
+        "read_file"
+        | "glob_search"
+        | "grep_search"
+        | "web_search"
+        | "web_fetch"
+        | "screenshot"
+        | "find_window"
+        | "read_screen_text" => 0,
+        "write_file"
+        | "edit_file"
+        | "bash"
+        | "click"
+        | "mouse_click"
+        | "click_text"
+        | "type"
+        | "type_text"
+        | "ue5_bridge"
+        | "blender_bridge"
+        | "unity_bridge" => 1,
         _ => 2,
     };
     if lvl < required {
@@ -3955,7 +4017,10 @@ mod tests {
         assert!(tool_requires_user_confirmation("bash"));
         assert!(tool_requires_user_confirmation("write_file"));
         assert!(tool_requires_user_confirmation("edit_file"));
+        assert!(tool_requires_user_confirmation("click"));
+        assert!(tool_requires_user_confirmation("type_text"));
         assert!(!tool_requires_user_confirmation("read_file"));
+        assert!(!tool_requires_user_confirmation("screenshot"));
     }
 
     #[test]

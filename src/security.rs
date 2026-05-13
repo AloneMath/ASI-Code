@@ -47,6 +47,19 @@ pub fn guard_tool_path_access(
                 candidates.push(path.to_string());
             }
         }
+        "type"
+        | "type_text"
+        | "click"
+        | "mouse_click"
+        | "click_text"
+        | "screenshot"
+        | "find_window"
+        | "read_screen_text"
+        | "ue5_bridge"
+        | "blender_bridge"
+        | "unity_bridge" => {
+            return Ok(());
+        }
         "glob_search" => {
             let pattern = strip_surrounding_quotes(args.trim());
             let base = glob_base(pattern);

@@ -296,7 +296,37 @@ enum Command {
         #[arg(long, default_value = "bench_reports")]
         out_dir: PathBuf,
     },
+    Ue5 {
+        #[arg(long)]
+        script: Option<String>,
+        #[arg(long = "script-file")]
+        script_file: Option<PathBuf>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Blender {
+        #[arg(long)]
+        script: Option<String>,
+        #[arg(long = "script-file")]
+        script_file: Option<PathBuf>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Unity {
+        #[arg(long)]
+        script: Option<String>,
+        #[arg(long = "script-file")]
+        script_file: Option<PathBuf>,
+        #[arg(long)]
+        project: String,
+    },
     Version,
+}
+
+#[derive(Debug, Clone)]
+struct BridgeScriptRequest {
+    script: String,
+    project: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1302,6 +1332,37 @@ fn handle_job_command(action: JobCommand) -> Result<(), String> {
             );
             Ok(())
         }
+    }
+}
+
+fn resolve_bridge_script_request(
+    script: Option<String>,
+    script_file: Option<PathBuf>,
+    project: Option<String>,
+) -> Result<BridgeScriptRequest, String> {
+    let content = match (script, script_file) {
+        (Some(s), None) => s,
+        (None, Some(path)) => fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read bridge script file {}: {}", path.display(), e))?,
+        (Some(_), Some(_)) => return Err("use only one of --script or --script-file".to_string()),
+        (None, None) => return Err("missing script: provide --script or --script-file".to_string()),
+    };
+    if content.trim().is_empty() {
+        return Err("bridge script is empty".to_string());
+    }
+    Ok(BridgeScriptRequest {
+        script: content,
+        project,
+    })
+}
+
+fn run_bridge_tool(tool: &str, payload: serde_json::Value) -> Result<(), String> {
+    let result = tools::run_tool(tool, &payload.to_string());
+    println!("{}", result.output);
+    if result.ok {
+        Ok(())
+    } else {
+        Err(format!("{} failed", tool))
     }
 }
 fn normalize_prompt_text(mut content: String) -> String {
@@ -3325,6 +3386,57 @@ fn run_repl(
         }
         if line == "/tools" {
             println!("{}", tool_index());
+            continue;
+        }
+        if line == "/computer" || line == "/computer help" {
+            println!(
+                "{}",
+                ui.info(
+                    "Usage:\n/computer screenshot\n/computer find_window <title>\n/computer click <x> <y>\n/computer click_text \"Save\"\n/computer type \"text\"\n/computer read_screen_text"
+                )
+            );
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/computer ") {
+            let trimmed = rest.trim();
+            if trimmed.is_empty() {
+                println!(
+                    "{}",
+                    ui.error("Usage: /computer <screenshot|find_window|click|click_text|type|read_screen_text> ...")
+                );
+                continue;
+            }
+            let (subcmd, subargs) = runtime::split_tool_public(trimmed);
+            let (tool_name, tool_args) = match subcmd.as_str() {
+                "screenshot" => ("screenshot".to_string(), String::new()),
+                "find_window" => ("find_window".to_string(), subargs),
+                "click" => ("click".to_string(), subargs),
+                "click_text" => ("click_text".to_string(), subargs),
+                "type" => ("type_text".to_string(), subargs),
+                "read_screen_text" => ("read_screen_text".to_string(), String::new()),
+                other => {
+                    println!(
+                        "{}",
+                        ui.error(&format!(
+                            "Unknown /computer subcommand: {} (expected screenshot|find_window|click|click_text|type|read_screen_text)",
+                            other
+                        ))
+                    );
+                    continue;
+                }
+            };
+            let command = if tool_args.trim().is_empty() {
+                format!("/toolcall {}", tool_name)
+            } else {
+                format!("/toolcall {} {}", tool_name, tool_args)
+            };
+            let result = rt.run_turn_streaming(&command, |_| {});
+            if let Some((name, status, body)) = parse_tool_payload(&result.text) {
+                println!("{}", ui.tool_panel(&name, &status, &compact_tool_panel_body(&name, &status, &body)));
+            } else {
+                let status = if result.stop_reason == "tool_result" { "result" } else { "error" };
+                println!("{}", ui.tool_panel(&tool_name, status, &result.text));
+            }
             continue;
         }
         if line == "/audit" || line == "/audit tail" {
@@ -10624,6 +10736,17 @@ fn looks_like_malformed_toolcall_output(text: &str) -> bool {
         "bash",
         "web_search",
         "web_fetch",
+        "screenshot",
+        "find_window",
+        "click",
+        "mouse_click",
+        "click_text",
+        "type",
+        "type_text",
+        "read_screen_text",
+        "ue5_bridge",
+        "blender_bridge",
+        "unity_bridge",
     ];
     let trimmed = lower.trim_start();
     if trimmed.starts_with("/toolcall ") {
@@ -10728,6 +10851,15 @@ fn looks_like_fabricated_tool_result_output(text: &str) -> bool {
         || lower.contains("[grep_search:")
         || lower.contains("[web_search:")
         || lower.contains("[web_fetch:")
+        || lower.contains("[screenshot:")
+        || lower.contains("[find_window:")
+        || lower.contains("[click:")
+        || lower.contains("[click_text:")
+        || lower.contains("[type_text:")
+        || lower.contains("[read_screen_text:")
+        || lower.contains("[ue5_bridge:")
+        || lower.contains("[blender_bridge:")
+        || lower.contains("[unity_bridge:")
         || lower.contains("\"stdout\"")
         || lower.contains("\"stderr\"")
         || lower.contains("\"exit_code\"")
@@ -10796,6 +10928,17 @@ fn looks_like_execution_ready_line(line: &str) -> bool {
         || lower.starts_with("<web_search")
         || lower.starts_with("<web_fetch")
         || lower.starts_with("<bash")
+        || lower.starts_with("<screenshot")
+        || lower.starts_with("<find_window")
+        || lower.starts_with("<click")
+        || lower.starts_with("<mouse_click")
+        || lower.starts_with("<click_text")
+        || lower.starts_with("<type")
+        || lower.starts_with("<type_text")
+        || lower.starts_with("<read_screen_text")
+        || lower.starts_with("<ue5_bridge")
+        || lower.starts_with("<blender_bridge")
+        || lower.starts_with("<unity_bridge")
         || lower.contains("tool_call")
         || lower.contains("toolcall")
     {
@@ -10810,6 +10953,17 @@ fn looks_like_execution_ready_line(line: &str) -> bool {
         "bash ",
         "web_search ",
         "web_fetch ",
+        "screenshot",
+        "find_window ",
+        "click ",
+        "mouse_click ",
+        "click_text ",
+        "type ",
+        "type_text ",
+        "read_screen_text",
+        "ue5_bridge ",
+        "blender_bridge ",
+        "unity_bridge ",
     ];
     prefixes.iter().any(|p| lower.starts_with(p))
 }
@@ -14845,7 +14999,7 @@ pub(crate) fn format_context_contract_header(
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "Context Contract:\nmode={} speed={} permission_mode={} tools=[read_file,write_file,edit_file,glob_search,grep_search,web_search,web_fetch,bash]\nconstraints={} budget={{steps:{},duration_secs:{},no_progress:{},constraint_blocks:{}}}\nprevious_loop_stop_reason={}",
+        "Context Contract:\nmode={} speed={} permission_mode={} tools=[read_file,write_file,edit_file,glob_search,grep_search,web_search,web_fetch,bash,screenshot,find_window,click,click_text,type_text,read_screen_text,ue5_bridge,blender_bridge,unity_bridge]\nconstraints={} budget={{steps:{},duration_secs:{},no_progress:{},constraint_blocks:{}}}\nprevious_loop_stop_reason={}",
         mode,
         speed.as_str(),
         rt.permission_mode,
@@ -15248,6 +15402,7 @@ fn build_repl_help_text_short() -> String {
         format_help_command_line("/secure <task>", "Run security-focused mode."),
         format_help_command_line("/review <task>", "Run bug/regression review mode."),
         format_help_command_line("/run <command>", "Execute a local shell command."),
+        format_help_command_line("/computer ...", "Desktop control helpers (screenshot/click/type/OCR)."),
         format_help_command_line("/project [path]", "Show or switch active project path."),
         format_help_command_line(
             "/model <name> | /provider <name>",
@@ -15274,6 +15429,14 @@ fn build_repl_help_text_short() -> String {
         format_help_command_line(
             "/help toolcall bash",
             "Detailed guide for bash tool execution.",
+        ),
+        format_help_command_line(
+            "/help toolcall screenshot",
+            "Detailed guide for screenshot tool.",
+        ),
+        format_help_command_line(
+            "/help computer",
+            "Desktop control command family guide.",
         ),
         "".to_string(),
         "Tip: Use /help topics for all topics, /help search <keyword> [--format markdown|json|jsonl] for structured output, or /help /mcp for focused docs.".to_string(),
@@ -15302,6 +15465,7 @@ fn build_repl_help_topics_text() -> String {
         format_help_command_line("/help plugin", "Plugin management and trust/verify."),
         format_help_command_line("/help hooks", "Hook handlers and validation."),
         format_help_command_line("/help voice", "Voice mode and PTT settings."),
+        format_help_command_line("/help computer", "Desktop control command family."),
         format_help_command_line("/help runtime-profile", "Runtime preset profiles."),
         format_help_command_line("/help work", "Work/code/secure/review mode prompts."),
         format_help_command_line("/help model", "Model/provider/profile/speed controls."),
@@ -15329,6 +15493,18 @@ fn build_repl_help_topics_text() -> String {
         format_help_command_line("/help toolcall web_search", "Detailed web_search tool guide."),
         format_help_command_line("/help toolcall web_fetch", "Detailed web_fetch tool guide."),
         format_help_command_line("/help toolcall bash", "Detailed bash tool guide."),
+        format_help_command_line("/help toolcall screenshot", "Detailed screenshot tool guide."),
+        format_help_command_line("/help toolcall find_window", "Detailed find_window tool guide."),
+        format_help_command_line("/help toolcall click", "Detailed click tool guide."),
+        format_help_command_line("/help toolcall click_text", "Detailed click_text tool guide."),
+        format_help_command_line("/help toolcall type_text", "Detailed type_text tool guide."),
+        format_help_command_line("/help toolcall read_screen_text", "Detailed OCR tool guide."),
+        format_help_command_line("/help toolcall ue5_bridge", "Detailed UE5 bridge tool guide."),
+        format_help_command_line(
+            "/help toolcall blender_bridge",
+            "Detailed Blender bridge tool guide.",
+        ),
+        format_help_command_line("/help toolcall unity_bridge", "Detailed Unity bridge tool guide."),
         "".to_string(),
         "Examples".to_string(),
         "/help /mcp oauth".to_string(),
@@ -15352,6 +15528,16 @@ fn repl_help_search_index() -> &'static [(&'static str, &'static str)] {
         ("toolcall web_search", "Search the web and return snippets"),
         ("toolcall web_fetch", "Fetch and parse webpage content"),
         ("toolcall bash", "Run shell commands in the project context"),
+        ("toolcall screenshot", "Capture screen as base64 PNG payload"),
+        ("toolcall find_window", "Find visible windows by title query"),
+        ("toolcall click", "Click absolute screen coordinate"),
+        ("toolcall click_text", "Click visible UI text label"),
+        ("toolcall type_text", "Type text into focused control"),
+        ("toolcall read_screen_text", "OCR text from current screen"),
+        ("toolcall ue5_bridge", "Run UE5 Python bridge payload"),
+        ("toolcall blender_bridge", "Run Blender Python bridge payload"),
+        ("toolcall unity_bridge", "Run Unity Python bridge payload"),
+        ("computer", "Desktop control subcommands"),
         ("permissions", "Permission modes and allow/deny rules"),
         ("agent", "Subagent lifecycle and task views"),
         ("mcp", "MCP server management and auth/config"),
@@ -15792,7 +15978,25 @@ Tools:
 - web_fetch: Fetch and parse webpage content.
   Example: /toolcall web_fetch \"https://example.com\"
 - bash: Execute shell command in current project.
-  Example: /toolcall bash \"cargo test --release\""
+  Example: /toolcall bash \"cargo test --release\"
+- screenshot: Capture screen and return base64 PNG payload.
+  Example: /toolcall screenshot
+- find_window: Find visible windows by title.
+  Example: /toolcall find_window \"Outlook\"
+- click: Click absolute screen coordinates.
+  Example: /toolcall click 1200 700
+- click_text: Click a UI element by visible text.
+  Example: /toolcall click_text \"Send\"
+- type_text: Type text into focused control.
+  Example: /toolcall type_text \"hello from ASI Code\"
+- read_screen_text: OCR text from current screen.
+  Example: /toolcall read_screen_text
+- ue5_bridge: Run Python script through UE5 bridge.
+  Example: /toolcall ue5_bridge {\"script\":\"print('hello')\",\"project\":\"D:/UE/MyProj/MyProj.uproject\"}
+- blender_bridge: Run Python script through Blender bridge.
+  Example: /toolcall blender_bridge {\"script\":\"print('hello')\"}
+- unity_bridge: Run Python script through Unity bridge.
+  Example: /toolcall unity_bridge {\"script\":\"print('hello')\",\"project\":\"D:/Unity/MyProj\"}"
         }
         "permissions" => {
             "Help Topic: /permissions
@@ -15950,6 +16154,21 @@ Usage:
 /scan [patterns...] [--deep|--deep=N] - Workspace scan.
 /run <command> - Execute shell command directly."
         }
+        "computer" => {
+            "Help Topic: /computer
+
+Usage:
+/computer screenshot
+/computer find_window <title>
+/computer click <x> <y>
+/computer click_text \"Save\"
+/computer type \"...\"
+/computer read_screen_text
+
+Notes:
+- `/computer type` maps to `type_text`.
+- `read_screen_text` requires `tesseract` in PATH."
+        }
         "privacy" | "flags" | "policy" => {
             "Help Topic: Safety Flags And Policy
 
@@ -16103,6 +16322,128 @@ Example:
 
 Notes:
 - Use after web_search to inspect a specific source URL.",
+        ),
+        "toolcall screenshot" => Some(
+            "Help Topic: /toolcall screenshot
+
+Purpose:
+Capture the current screen and return a base64 PNG payload.
+
+Usage:
+/toolcall screenshot
+
+Notes:
+- Returns JSON with image_base64 + dimensions.
+- Windows-only in current implementation.",
+        ),
+        "toolcall find_window" => Some(
+            "Help Topic: /toolcall find_window
+
+Purpose:
+Find visible top-level windows by title query.
+
+Usage:
+/toolcall find_window <title>
+
+Example:
+/toolcall find_window \"Outlook\"",
+        ),
+        "toolcall click" => Some(
+            "Help Topic: /toolcall click
+
+Purpose:
+Click absolute screen coordinates.
+
+Usage:
+/toolcall click <x> <y>
+
+Example:
+/toolcall click 1200 700",
+        ),
+        "toolcall click_text" => Some(
+            "Help Topic: /toolcall click_text
+
+Purpose:
+Click a UI element by exact visible label text.
+
+Usage:
+/toolcall click_text <text>
+
+Example:
+/toolcall click_text \"Send\"",
+        ),
+        "toolcall type_text" | "toolcall type" => Some(
+            "Help Topic: /toolcall type_text
+
+Purpose:
+Type text into the currently focused control.
+
+Usage:
+/toolcall type_text <text>
+
+Example:
+/toolcall type_text \"hello from ASI Code\"",
+        ),
+        "toolcall read_screen_text" => Some(
+            "Help Topic: /toolcall read_screen_text
+
+Purpose:
+Capture the current screen and run OCR text extraction.
+
+Usage:
+/toolcall read_screen_text
+
+Notes:
+- Requires `tesseract` in PATH.
+- Windows-only in current implementation.",
+        ),
+        "toolcall ue5_bridge" => Some(
+            "Help Topic: /toolcall ue5_bridge
+
+Purpose:
+Run Python script through Unreal Engine 5 bridge.
+
+Usage:
+/toolcall ue5_bridge <json>
+
+Example:
+/toolcall ue5_bridge {\"script\":\"print('hello')\",\"project\":\"D:/UE/MyProj/MyProj.uproject\"}
+
+Notes:
+- Uses UnrealEditor command-line Python execution.
+- Set editor path via ASI_UE5_EDITOR or UE5_EDITOR if needed.",
+        ),
+        "toolcall blender_bridge" => Some(
+            "Help Topic: /toolcall blender_bridge
+
+Purpose:
+Run Python script through Blender bridge.
+
+Usage:
+/toolcall blender_bridge <json>
+
+Example:
+/toolcall blender_bridge {\"script\":\"print('hello from blender')\"}
+
+Notes:
+- Uses `blender --background --python`.
+- Set binary via ASI_BLENDER_BIN or BLENDER_BIN if needed.",
+        ),
+        "toolcall unity_bridge" => Some(
+            "Help Topic: /toolcall unity_bridge
+
+Purpose:
+Run Python script through Unity bridge.
+
+Usage:
+/toolcall unity_bridge <json>
+
+Example:
+/toolcall unity_bridge {\"script\":\"print('hello from unity')\",\"project\":\"D:/Unity/MyProj\"}
+
+Notes:
+- Requires a Unity-side entrypoint method: `PythonRunner.RunFile`.
+- Set editor path via ASI_UNITY_EDITOR or UNITY_EDITOR if needed.",
         ),
         "toolcall bash" => Some(
             "Help Topic: /toolcall bash
@@ -16297,6 +16638,7 @@ fn build_repl_help_text() -> String {
             "Scan workspace files.",
         ),
         format_help_command_line("/run <command>", "Execute a local shell command."),
+        format_help_command_line("/computer ...", "Desktop control helpers."),
         format_help_command_line("/work <task>", "Run workspace-aware coding mode."),
         format_help_command_line("/code <task>", "Run code-focused mode."),
         format_help_command_line("/secure <task>", "Run security-focused mode."),
@@ -16447,7 +16789,47 @@ fn build_repl_help_text() -> String {
             "Execute shell command in current project.",
         ),
         format_help_command_line(
-            "/help toolcall <read_file|write_file|edit_file|glob_search|grep_search|web_search|web_fetch|bash>",
+            "/toolcall screenshot",
+            "Capture screen as base64 PNG payload.",
+        ),
+        format_help_command_line(
+            "/toolcall find_window <title>",
+            "Find visible windows by title query.",
+        ),
+        format_help_command_line(
+            "/toolcall click <x> <y>",
+            "Click absolute screen coordinates.",
+        ),
+        format_help_command_line(
+            "/toolcall click_text <text>",
+            "Click UI element by visible text label.",
+        ),
+        format_help_command_line(
+            "/toolcall type_text <text>",
+            "Type text into focused control.",
+        ),
+        format_help_command_line(
+            "/toolcall read_screen_text",
+            "OCR text from current screen.",
+        ),
+        format_help_command_line(
+            "/toolcall ue5_bridge <json>",
+            "Run UE5 Python bridge script payload.",
+        ),
+        format_help_command_line(
+            "/toolcall blender_bridge <json>",
+            "Run Blender Python bridge script payload.",
+        ),
+        format_help_command_line(
+            "/toolcall unity_bridge <json>",
+            "Run Unity Python bridge script payload.",
+        ),
+        format_help_command_line(
+            "/computer <subcommand>",
+            "Convenience desktop control command family.",
+        ),
+        format_help_command_line(
+            "/help toolcall <read_file|write_file|edit_file|glob_search|grep_search|web_search|web_fetch|bash|screenshot|find_window|click|click_text|type_text|read_screen_text|ue5_bridge|blender_bridge|unity_bridge>",
             "Show detailed guide for one tool.",
         ),
         "".to_string(),

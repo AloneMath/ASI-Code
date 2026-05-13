@@ -248,6 +248,132 @@ pub fn tool_definitions_openai() -> Value {
                     "required": ["url"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "screenshot",
+                "description": "Capture the current screen and return base64 PNG data plus dimensions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "find_window",
+                "description": "Find visible top-level windows whose title contains the query.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Window title query"}
+                    },
+                    "required": ["title"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "click",
+                "description": "Click mouse at absolute screen coordinates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer", "description": "X coordinate"},
+                        "y": {"type": "integer", "description": "Y coordinate"}
+                    },
+                    "required": ["x", "y"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "click_text",
+                "description": "Click UI element by visible text label using Windows UI Automation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Exact label text"}
+                    },
+                    "required": ["text"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "type_text",
+                "description": "Type text into the focused UI control.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Text to type"}
+                    },
+                    "required": ["text"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_screen_text",
+                "description": "Capture screen and run OCR, returning extracted text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ue5_bridge",
+                "description": "Run Python script through Unreal Engine 5 bridge. Uses UnrealEditor command line execution.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "script": {"type": "string", "description": "Python script source to execute"},
+                        "project": {"type": "string", "description": "Optional UE project path"}
+                    },
+                    "required": ["script"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "blender_bridge",
+                "description": "Run Python script through Blender bridge (`blender --background --python`).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "script": {"type": "string", "description": "Python script source to execute"},
+                        "project": {"type": "string", "description": "Optional blend file path (reserved)"}
+                    },
+                    "required": ["script"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "unity_bridge",
+                "description": "Run Python script through Unity bridge via batchmode entrypoint `PythonRunner.RunFile`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "script": {"type": "string", "description": "Python script source to execute"},
+                        "project": {"type": "string", "description": "Unity project path"}
+                    },
+                    "required": ["script", "project"]
+                }
+            }
         }
     ])
 }
@@ -348,6 +474,105 @@ pub fn tool_definitions_claude() -> Value {
                 },
                 "required": ["url"]
             }
+        },
+        {
+            "name": "screenshot",
+            "description": "Capture the current screen and return base64 PNG data plus dimensions.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "find_window",
+            "description": "Find visible top-level windows whose title contains the query.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Window title query"}
+                },
+                "required": ["title"]
+            }
+        },
+        {
+            "name": "click",
+            "description": "Click mouse at absolute screen coordinates.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "X coordinate"},
+                    "y": {"type": "integer", "description": "Y coordinate"}
+                },
+                "required": ["x", "y"]
+            }
+        },
+        {
+            "name": "click_text",
+            "description": "Click UI element by visible text label using Windows UI Automation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Exact label text"}
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "type_text",
+            "description": "Type text into the focused UI control.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to type"}
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "read_screen_text",
+            "description": "Capture screen and run OCR, returning extracted text.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "ue5_bridge",
+            "description": "Run Python script through Unreal Engine 5 bridge. Uses UnrealEditor command line execution.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "description": "Python script source to execute"},
+                    "project": {"type": "string", "description": "Optional UE project path"}
+                },
+                "required": ["script"]
+            }
+        },
+        {
+            "name": "blender_bridge",
+            "description": "Run Python script through Blender bridge (`blender --background --python`).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "description": "Python script source to execute"},
+                    "project": {"type": "string", "description": "Optional blend file path (reserved)"}
+                },
+                "required": ["script"]
+            }
+        },
+        {
+            "name": "unity_bridge",
+            "description": "Run Python script through Unity bridge via batchmode entrypoint `PythonRunner.RunFile`.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "description": "Python script source to execute"},
+                    "project": {"type": "string", "description": "Unity project path"}
+                },
+                "required": ["script", "project"]
+            }
         }
     ])
 }
@@ -404,6 +629,47 @@ pub fn tool_call_to_legacy_args(name: &str, arguments: &str) -> String {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        "screenshot" => String::new(),
+        "find_window" => args
+            .get("title")
+            .or_else(|| args.get("query"))
+            .or_else(|| args.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "click" | "mouse_click" => {
+            let x = args
+                .get("x")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                })
+                .unwrap_or(0);
+            let y = args
+                .get("y")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                })
+                .unwrap_or(0);
+            format!("{} {}", x, y)
+        }
+        "click_text" => args
+            .get("text")
+            .or_else(|| args.get("label"))
+            .or_else(|| args.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "type" | "type_text" => args
+            .get("text")
+            .or_else(|| args.get("content"))
+            .or_else(|| args.get("input"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "read_screen_text" => String::new(),
+        "ue5_bridge" | "blender_bridge" | "unity_bridge" => args.to_string(),
         _ => arguments.to_string(),
     }
 }
@@ -1229,5 +1495,62 @@ impl ChatProvider for ProviderClient {
     ) -> Result<CompletionResult, String> {
         let mut proxy = |delta: &str| on_delta(delta);
         self.complete_with_tools(messages, tool_results, &mut proxy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_call_to_legacy_args;
+
+    #[test]
+    fn tool_call_to_legacy_args_maps_computer_tools() {
+        assert_eq!(
+            tool_call_to_legacy_args("screenshot", "{}"),
+            ""
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("find_window", r#"{"title":"Outlook"}"#),
+            "Outlook"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("click", r#"{"x":120,"y":340}"#),
+            "120 340"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("click_text", r#"{"text":"Send"}"#),
+            "Send"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("type_text", r#"{"text":"hello"}"#),
+            "hello"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("read_screen_text", "{}"),
+            ""
+        );
+    }
+
+    #[test]
+    fn tool_call_to_legacy_args_maps_aliases_for_computer_tools() {
+        assert_eq!(
+            tool_call_to_legacy_args("find_window", r#"{"query":"Notepad"}"#),
+            "Notepad"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("find_window", r#"{"name":"Calculator"}"#),
+            "Calculator"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("mouse_click", r#"{"x":"42","y":"24"}"#),
+            "42 24"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("type", r#"{"content":"abc"}"#),
+            "abc"
+        );
+        assert_eq!(
+            tool_call_to_legacy_args("type_text", r#"{"input":"xyz"}"#),
+            "xyz"
+        );
     }
 }

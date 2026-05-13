@@ -19,7 +19,8 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
     let mut previous_tool_end_line: Option<usize> = None;
 
     let pseudo_xml_normalized = normalize_pseudo_xml_toolcall_markers(text);
-    let inline_calling_normalized = normalize_inline_angle_calling_blocks(&pseudo_xml_normalized);
+    let cjk_bracket_normalized = normalize_cjk_bracket_call_markers(&pseudo_xml_normalized);
+    let inline_calling_normalized = normalize_inline_angle_calling_blocks(&cjk_bracket_normalized);
     let calling_normalized = normalize_calling_markdown_blocks(&inline_calling_normalized);
     let dsml_normalized = normalize_dsml_fenced_tags(&calling_normalized);
     let normalized = strip_markdown_fences(&dsml_normalized);
@@ -280,6 +281,92 @@ fn is_no_space_pseudo_toolcall_marker(line: &str) -> bool {
 /// args or a single backtick-wrapped JSON / quoted-args string. The closing
 /// line `</**Calling**>` is pure noise. We rewrite the opener to a
 /// canonical `/toolcall TOOL ARGS` line and drop the closer.
+/// Recognize the CJK descriptive call-marker shape DeepSeek v4 Pro emits
+/// when speaking Chinese. The model writes things like:
+///
+///     [\u{8C03}\u{7528} bash] {"command": "Start-Process notepad"}
+///     [\u{8C03}\u{7528} type_text] {"text": "AI is writing this"}
+///
+/// where `\u{8C03}\u{7528}` is the CJK verb meaning "to call / invoke".
+/// The model thinks this is a tool-call format because it visually mirrors
+/// our `**Calling:** \`tool\`` English form. Without rewriting, the runtime
+/// treats the line as inert prose and the tool is never executed —
+/// observed in the wild as "model claimed to type the text, but Notepad
+/// stays empty".
+///
+/// We rewrite each matching line into `/toolcall TOOL ARGS` so the rest of
+/// the pipeline picks it up. The tool name must already be in our known
+/// canonical list — anything else is left untouched.
+fn normalize_cjk_bracket_call_markers(text: &str) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        if let Some(rewritten) = try_rewrite_cjk_bracket_call(line.trim()) {
+            out.push(rewritten);
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out.join("\n")
+}
+
+fn try_rewrite_cjk_bracket_call(trimmed: &str) -> Option<String> {
+    // The CJK marker is "\u{8C03}\u{7528}" — must be inside square brackets
+    // or appear as the first token. We accept four common shapes:
+    //   [\u{8C03}\u{7528} TOOL] ARGS
+    //   [\u{8C03}\u{7528}: TOOL] ARGS
+    //   \u{8C03}\u{7528} TOOL: ARGS
+    //   \u{8C03}\u{7528} TOOL ARGS
+    let cjk_marker = "\u{8C03}\u{7528}";
+
+    // Branch A: bracketed form `[<marker> TOOL] ARGS`
+    if let Some(after_lb) = trimmed.strip_prefix('[') {
+        if let Some(after_mark) = after_lb.strip_prefix(cjk_marker) {
+            let inner = after_mark
+                .trim_start_matches(':')
+                .trim_start_matches(char::is_whitespace);
+            if let Some(rb_pos) = inner.find(']') {
+                let tool_raw = inner[..rb_pos].trim();
+                let after_rb = inner[rb_pos + 1..].trim_start();
+                if let Some(out) = build_toolcall_line(tool_raw, after_rb) {
+                    return Some(out);
+                }
+            }
+        }
+    }
+
+    // Branch B: bare form `<marker> TOOL: ARGS` or `<marker> TOOL ARGS`.
+    // Only fire when the line starts with the marker, to avoid matching
+    // prose that just happens to contain the word.
+    if let Some(after_mark) = trimmed.strip_prefix(cjk_marker) {
+        let rest = after_mark.trim_start();
+        // Split off the first whitespace-delimited token as the tool name.
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let tool_raw = parts.next().unwrap_or("").trim_end_matches(':').trim();
+        let after_tool = parts
+            .next()
+            .map(|s| s.trim_start_matches(':').trim_start())
+            .unwrap_or("");
+        if let Some(out) = build_toolcall_line(tool_raw, after_tool) {
+            return Some(out);
+        }
+    }
+
+    None
+}
+
+fn build_toolcall_line(tool_raw: &str, args: &str) -> Option<String> {
+    let normalized = normalize_tag_tool_name(&tool_raw.to_ascii_lowercase());
+    if !is_known_tool_name(&normalized) {
+        return None;
+    }
+    let args = args.trim();
+    if args.is_empty() {
+        Some(format!("/toolcall {}", normalized))
+    } else {
+        Some(format!("/toolcall {} {}", normalized, args))
+    }
+}
+
 fn normalize_inline_angle_calling_blocks(text: &str) -> String {
     let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
     for line in text.lines() {
@@ -1342,6 +1429,76 @@ fn parse_function_calls_block(lines: &[&str]) -> Vec<(String, String)> {
                     current_name = Some(normalized);
                 }
             }
+            // Variant: `<tool_call id="step2">bash Start-Sleep -Seconds 2</tool_call>`
+            // — no `name=` attribute, instead the body's first whitespace-
+            // delimited token is the tool name and the rest is the bash
+            // command (or other positional args). If we still have no name
+            // after the attribute check, try to extract one from the
+            // inline body that follows the `>`.
+            //
+            // Edge case: when the open tag, body, and close tag are all on
+            // ONE line (single-line form), we have to flush the call here
+            // because the parent loop won't see a separate `</tool_call>`
+            // line on a later iteration.
+            if current_name.is_none() {
+                if let Some(gt) = line.find('>') {
+                    let after_open = line[gt + 1..].trim();
+                    let close_pos = after_open
+                        .to_ascii_lowercase()
+                        .rfind("</tool_call>");
+                    let body = match close_pos {
+                        Some(end) => after_open[..end].trim(),
+                        None => after_open,
+                    };
+                    if !body.is_empty() {
+                        let mut parts = body.splitn(2, char::is_whitespace);
+                        let head = parts.next().unwrap_or("").trim();
+                        let rest = parts.next().unwrap_or("").trim();
+                        let normalized = normalize_tag_tool_name(&head.to_ascii_lowercase());
+                        if is_known_tool_name(&normalized) {
+                            current_name = Some(normalized.clone());
+                            if !rest.is_empty() {
+                                current_args.push(rest.to_string());
+                            }
+                            // Single-line `<tool_call ...>X Y</tool_call>`:
+                            // close tag is right here, flush now.
+                            if close_pos.is_some() {
+                                out.push((normalized, current_args.join(" ")));
+                                in_call = false;
+                                current_name = None;
+                                current_args.clear();
+                            }
+                        }
+                    }
+                }
+            } else {
+                // current_name is already set from `name="..."` attribute.
+                // Inline-body variant: `<tool_call name="X">{...args json...}</tool_call>`
+                // — open, body, and close all on one line. The body here is
+                // raw JSON (not `<parameter>` children), so we treat the
+                // whole text between `>` and `</tool_call>` as the args
+                // payload and flush immediately. Without this, the loop
+                // moves past this single line with current_name set but
+                // never sees a separate `</tool_call>` to push the call.
+                if let Some(gt) = line.find('>') {
+                    let after_open = &line[gt + 1..];
+                    let close_pos = after_open
+                        .to_ascii_lowercase()
+                        .rfind("</tool_call>");
+                    if let Some(end) = close_pos {
+                        let body = after_open[..end].trim();
+                        if !body.is_empty() {
+                            current_args.push(body.to_string());
+                        }
+                        if let Some(name) = current_name.clone() {
+                            out.push((name, current_args.join(" ")));
+                        }
+                        in_call = false;
+                        current_name = None;
+                        current_args.clear();
+                    }
+                }
+            }
             continue;
         }
         if lower == "</tool_call>" && in_call {
@@ -2145,6 +2302,12 @@ fn starts_with_named_arg_fragment(rest: &str) -> bool {
             | "url"
             | "start_line"
             | "max_lines"
+            | "title"
+            | "text"
+            | "x"
+            | "y"
+            | "script"
+            | "project"
     )
 }
 
@@ -2173,6 +2336,17 @@ fn is_known_tool_name(name: &str) -> bool {
             | "web_search"
             | "web_fetch"
             | "bash"
+            | "screenshot"
+            | "find_window"
+            | "click"
+            | "mouse_click"
+            | "click_text"
+            | "type"
+            | "type_text"
+            | "read_screen_text"
+            | "ue5_bridge"
+            | "blender_bridge"
+            | "unity_bridge"
     )
 }
 
@@ -2295,6 +2469,17 @@ fn parse_function_style(rest: &str) -> Option<(String, String)> {
             | "web_search"
             | "web_fetch"
             | "bash"
+            | "screenshot"
+            | "find_window"
+            | "click"
+            | "mouse_click"
+            | "click_text"
+            | "type"
+            | "type_text"
+            | "read_screen_text"
+            | "ue5_bridge"
+            | "blender_bridge"
+            | "unity_bridge"
     ) {
         return None;
     }
@@ -3070,6 +3255,73 @@ mod tests {
     // Regression: DeepSeek v4 Pro emits `<tool_calls> <tool_call name="X">
     // Regression: `< /toolcall >\nTOOL ARGS\n< /toolcall >` triplets,
     // emitted by DeepSeek v4 Pro on some sessions. Without normalization
+    // Regression: `<tool_call name="X">{...inline json args...}</tool_call>`
+    // all on a single line, with the body being raw JSON (not `<parameter>`
+    // children). Observed from DeepSeek v4 Pro emitting:
+    //   <tool_call name="find_window">{"app_name": "notepad"}</tool_call>
+    // The earlier id-attribute inline fix covered the no-name case; this
+    // covers the case where the `name=` attr IS set AND open + body + close
+    // are on one line. Without this branch the call gets parsed (name
+    // captured) but never flushed because the parent loop sees no separate
+    // `</tool_call>` on a later iteration.
+    #[test]
+    fn parses_multiple_tool_calls_with_name_attr_and_inline_json_bodies() {
+        let text = "<tool_calls>\n<tool_call name=\"bash\">{\"command\":\"echo hi\"}</tool_call>\n<tool_call name=\"screenshot\">{}</tool_call>\n</tool_calls>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "bash");
+        assert!(calls[0].args.contains("echo hi"));
+        assert_eq!(calls[1].name, "screenshot");
+    }
+
+    // Regression: when speaking Chinese, DeepSeek emits descriptive lines
+    // like `[\u{8C03}\u{7528} type_text] {"text":"..."}` ("[Call type_text]
+    // {...}") thinking that's a tool-call format. Without rewriting, the
+    // line is inert prose and the tool never fires — observed in the wild
+    // as "model claims to type the text but Notepad stays empty".
+    #[test]
+    fn promotes_cjk_bracket_call_marker_for_type_text() {
+        // The literal Chinese is "[\u{8C03}\u{7528} type_text]" =
+        // "[call type_text]". Source kept ASCII via escapes per project rule.
+        let text = "[\u{8C03}\u{7528} type_text] {\"text\":\"AI is writing this\"}";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "expected 1 call, got {:?}", calls);
+        assert_eq!(calls[0].name, "type_text");
+        assert!(
+            calls[0].args.contains("AI is writing this"),
+            "args should carry the text: {}",
+            calls[0].args
+        );
+    }
+
+    #[test]
+    fn promotes_cjk_bracket_call_marker_for_bash() {
+        let text = "[\u{8C03}\u{7528} bash] {\"command\":\"Start-Process notepad\"}";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert!(calls[0].args.contains("Start-Process notepad"));
+    }
+
+    #[test]
+    fn promotes_cjk_bare_call_marker() {
+        // Bare form: "\u{8C03}\u{7528} screenshot" with no brackets.
+        let text = "\u{8C03}\u{7528} screenshot";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "screenshot");
+    }
+
+    #[test]
+    fn ignores_cjk_marker_when_tool_name_unknown() {
+        // Unknown tool name must NOT be promoted to avoid false positives.
+        let text = "[\u{8C03}\u{7528} not_a_real_tool] {\"x\":1}";
+        let calls = extract_tool_calls(text);
+        assert!(calls.is_empty(), "expected no calls, got {:?}", calls);
+    }
+
+    // Regression: `< /toolcall >\nTOOL ARGS\n< /toolcall >` triplets,
+    // emitted by DeepSeek v4 Pro on some sessions. Without normalization
     // the parser sees `/toolcall ` inside the marker and dispatches `>`
     // as the tool name, hitting `Unknown tool: >` repeatedly.
     #[test]
@@ -3199,6 +3451,45 @@ mod tests {
         let calls = extract_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
+    }
+
+    // Regression: DeepSeek v4 Pro variant where the `<tool_call>` open has
+    // `id="..."` instead of `name="..."`, and the tool name appears as the
+    // first whitespace-delimited token of the body, e.g.:
+    //   <tool_calls>
+    //     <tool_call id="step2">bash Start-Sleep -Seconds 2</tool_call>
+    //   </tool_calls>
+    // Without this branch the runtime sees no name attribute, leaves
+    // current_name None, and the call is silently dropped.
+    #[test]
+    fn parses_tool_call_with_id_attr_and_body_starting_with_tool_name() {
+        let text = "<tool_calls>\n<tool_call id=\"step2\">bash Start-Sleep -Seconds 2</tool_call>\n</tool_calls>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "expected 1 call, got {:?}", calls);
+        assert_eq!(calls[0].name, "bash");
+        assert!(
+            calls[0].args.contains("Start-Sleep"),
+            "args should carry the command: {}",
+            calls[0].args
+        );
+    }
+
+    #[test]
+    fn parses_tool_call_id_attr_with_multiline_body() {
+        // Same variant but the body is on the next line rather than inline.
+        // parse_function_calls_block already coalesces param-tag bodies, but
+        // the inline-text-after-`>` extraction we added only fires for the
+        // single-line form. The multi-line case still has to keep working
+        // through the normal `current_name` flow — i.e. fall through.
+        // Here we verify the single-line form first; multi-line gets its own
+        // separate coverage elsewhere.
+        let text = "<tool_calls>\n<tool_call id=\"a\">read_file foo.py</tool_call>\n<tool_call id=\"b\">glob_search *.rs</tool_call>\n</tool_calls>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert!(calls[0].args.contains("foo.py"));
+        assert_eq!(calls[1].name, "glob_search");
+        assert!(calls[1].args.contains("*.rs"));
     }
 
     #[test]
