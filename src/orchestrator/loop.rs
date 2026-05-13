@@ -6,6 +6,37 @@ enum LoopMode {
     PromptCompact,
 }
 
+/// Outcome of a single auto-loop round for purposes of the no-progress
+/// circuit-breaker. A round can either advance changed_files (full
+/// progress), produce only successful read-only tool calls (still
+/// progress — the model is doing useful work like screenshots,
+/// inspection, web search), or do neither (truly stuck).
+///
+/// The previous implementation only treated `FilesChanged` as progress,
+/// which incorrectly tripped the circuit breaker on read-heavy tasks
+/// (computer control, debugging-via-inspection, research) even when the
+/// model was making real headway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundProgress {
+    FilesChanged,
+    ReadOnlyToolSuccess,
+    Nothing,
+}
+
+fn classify_round_progress(
+    new_changed_files_count: usize,
+    previous_changed_files_count: usize,
+    any_successful_tool_call: bool,
+) -> RoundProgress {
+    if new_changed_files_count > previous_changed_files_count {
+        RoundProgress::FilesChanged
+    } else if any_successful_tool_call {
+        RoundProgress::ReadOnlyToolSuccess
+    } else {
+        RoundProgress::Nothing
+    }
+}
+
 fn auto_loop_stop_reason_at_loop_head(
     started: Instant,
     limits: AutoLoopLimits,
@@ -161,11 +192,23 @@ fn apply_followup_turn_updates(
     *extra_cost += next.turn_cost_usd;
     collect_native_changed_files(&next.native_tool_calls, changed_files);
 
-    if changed_files.len() > *last_progress_count {
-        *no_progress_rounds = 0;
-        *last_progress_count = changed_files.len();
-    } else {
-        *no_progress_rounds += 1;
+    let any_successful_tool_call = next.native_tool_calls.iter().any(|c| c.ok);
+    let new_changed_files_count = changed_files.len();
+    match classify_round_progress(
+        new_changed_files_count,
+        *last_progress_count,
+        any_successful_tool_call,
+    ) {
+        RoundProgress::FilesChanged => {
+            *no_progress_rounds = 0;
+            *last_progress_count = new_changed_files_count;
+        }
+        RoundProgress::ReadOnlyToolSuccess => {
+            *no_progress_rounds = 0;
+        }
+        RoundProgress::Nothing => {
+            *no_progress_rounds += 1;
+        }
     }
 
     if is_tool_failure(next) {
@@ -1311,4 +1354,45 @@ fn run_prompt_auto_tool_loop(
         LoopMode::PromptCompact,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_round_progress, RoundProgress};
+
+    #[test]
+    fn progress_when_changed_files_grow() {
+        // Even with no successful tool calls (e.g. native call ran but
+        // returned ok=false), a growing changed_files set is real work.
+        let got = classify_round_progress(3, 1, false);
+        assert_eq!(got, RoundProgress::FilesChanged);
+    }
+
+    #[test]
+    fn progress_when_only_read_only_tool_succeeds() {
+        // No new file writes, but at least one tool call succeeded —
+        // this is the regression case: prior logic would have called
+        // this "no progress" and eventually tripped the circuit breaker
+        // mid-investigation.
+        let got = classify_round_progress(2, 2, true);
+        assert_eq!(got, RoundProgress::ReadOnlyToolSuccess);
+    }
+
+    #[test]
+    fn no_progress_when_all_calls_failed_and_no_files_changed() {
+        // A round where every tool call errored AND nothing was written.
+        // This is the only state that should advance the no_progress
+        // counter toward the stop threshold.
+        let got = classify_round_progress(0, 0, false);
+        assert_eq!(got, RoundProgress::Nothing);
+    }
+
+    #[test]
+    fn files_changed_wins_over_read_only_when_both_present() {
+        // If a round both wrote a file AND had successful read-only
+        // calls, classify as FilesChanged so last_progress_count is
+        // updated correctly.
+        let got = classify_round_progress(5, 4, true);
+        assert_eq!(got, RoundProgress::FilesChanged);
+    }
 }
