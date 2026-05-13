@@ -308,11 +308,13 @@ pub fn tool_definitions_openai() -> Value {
             "type": "function",
             "function": {
                 "name": "type_text",
-                "description": "Type text into the focused UI control.",
+                "description": "Type text into a target window via synthetic keystrokes. IMPORTANT: SendKeys posts to the foreground window, so when targeting a GUI app (Notepad, browser, editor) you MUST pass window_pid (preferred) or window_title so the tool can activate that window first. Without one of those, keystrokes will go to the terminal running asi-code, not your app.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "text": {"type": "string", "description": "Text to type"}
+                        "text": {"type": "string", "description": "Text to type"},
+                        "window_pid": {"type": "integer", "description": "PID of the process whose main window should receive keystrokes (preferred; obtain from find_window)"},
+                        "window_title": {"type": "string", "description": "Case-insensitive substring of the target window title (used only if window_pid is not provided)"}
                     },
                     "required": ["text"]
                 }
@@ -520,11 +522,13 @@ pub fn tool_definitions_claude() -> Value {
         },
         {
             "name": "type_text",
-            "description": "Type text into the focused UI control.",
+            "description": "Type text into a target window via synthetic keystrokes. IMPORTANT: SendKeys posts to the foreground window, so when targeting a GUI app (Notepad, browser, editor) you MUST pass window_pid (preferred) or window_title so the tool can activate that window first. Without one of those, keystrokes will go to the terminal running asi-code, not your app.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "Text to type"}
+                    "text": {"type": "string", "description": "Text to type"},
+                    "window_pid": {"type": "integer", "description": "PID of the process whose main window should receive keystrokes (preferred; obtain from find_window)"},
+                    "window_title": {"type": "string", "description": "Case-insensitive substring of the target window title (used only if window_pid is not provided)"}
                 },
                 "required": ["text"]
             }

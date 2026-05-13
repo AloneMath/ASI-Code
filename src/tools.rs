@@ -244,7 +244,29 @@ pub fn run_tool(name: &str, args: &str) -> ToolResult {
             let text = extract_json_string_arg(args.trim(), &["text", "content", "input"])
                 .or_else(|| extract_key_value_string_arg(args.trim(), &["text", "content", "input"]))
                 .unwrap_or_else(|| strip_surrounding_quotes(args.trim()).to_string());
-            type_text(&text)
+            // Optional focus target: prefer PID (most precise), then window
+            // title substring. If neither is provided, SendKeys fires at
+            // whatever window currently has foreground focus — which is
+            // almost always the terminal, NOT the app the user wanted.
+            let window_pid =
+                extract_json_usize_arg(args.trim(), &["window_pid", "pid", "target_pid"])
+                    .or_else(|| {
+                        extract_key_value_usize_arg(
+                            args.trim(),
+                            &["window_pid", "pid", "target_pid"],
+                        )
+                    });
+            let window_title = extract_json_string_arg(
+                args.trim(),
+                &["window_title", "window", "target", "target_title"],
+            )
+            .or_else(|| {
+                extract_key_value_string_arg(
+                    args.trim(),
+                    &["window_title", "window", "target", "target_title"],
+                )
+            });
+            type_text_into(&text, window_pid, window_title.as_deref())
         }
         "read_screen_text" => read_screen_text(),
         "ue5_bridge" => ue5_bridge(args),
@@ -2250,21 +2272,121 @@ if ($null -eq $inv) {{
     run_windows_gui_powershell(&script)
 }
 
-pub fn type_text(text: &str) -> ToolResult {
+/// Send synthetic keystrokes to a target window via `SendKeys::SendWait`.
+///
+/// `SendKeys` posts to the foreground window only — it does NOT take a
+/// window handle. If we don't activate the target first, keys go to
+/// whatever window currently has focus, which in agent-driven use is
+/// almost always the terminal running asi-code, NOT the application the
+/// user wanted to type into. This produces the silent-failure pattern
+/// "type_text returns ok with length=N but Notepad stays empty."
+///
+/// Strategy: when `pid` or `title_substring` is provided, locate the
+/// matching window handle via `Process.MainWindowHandle` lookup, call
+/// `SetForegroundWindow` to activate it, briefly sleep so focus actually
+/// transfers, then send keys. Always echo back which target was activated
+/// in the JSON result so callers can verify.
+///
+/// If neither pid nor title is provided, behavior matches the legacy
+/// "send to current foreground" form — caveat emptor, see warning above.
+pub fn type_text_into(
+    text: &str,
+    pid: Option<usize>,
+    title_substring: Option<&str>,
+) -> ToolResult {
     if text.is_empty() {
         return ToolResult::err("type_text requires non-empty text");
     }
-    let esc = powershell_escape_single_quoted(text);
+    let esc_text = powershell_escape_single_quoted(text);
+    let esc_title = title_substring
+        .map(powershell_escape_single_quoted)
+        .unwrap_or_default();
+    let pid_literal = pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "$null".to_string());
+
     let script = format!(
         r#"
 Add-Type -AssemblyName System.Windows.Forms
 
-$text = '{text}'
-[System.Windows.Forms.SendKeys]::SendWait($text)
+# Win32: SetForegroundWindow + ShowWindow are needed to reliably yank
+# focus to a background window before SendKeys posts to it.
+if (-not ('Asi.NativeWin' -as [type])) {{
+  Add-Type -Namespace Asi -Name NativeWin -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport(\"user32.dll\")]
+public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport(\"user32.dll\")]
+public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport(\"user32.dll\")]
+public static extern bool IsIconic(System.IntPtr hWnd);
+"@
+}}
 
-[ordered]@{{ typed = $true; length = $text.Length }} | ConvertTo-Json -Compress
+$targetHandle = [System.IntPtr]::Zero
+$targetPid = {pid_literal}
+$targetTitleSubstr = '{title}'
+
+if ($null -ne $targetPid) {{
+  $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+  if ($proc -and $proc.MainWindowHandle -ne 0) {{
+    $targetHandle = $proc.MainWindowHandle
+  }}
+}} elseif ($targetTitleSubstr -and $targetTitleSubstr.Length -gt 0) {{
+  $match = Get-Process | Where-Object {{
+    $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -and $_.MainWindowTitle.ToLower().Contains($targetTitleSubstr.ToLower())
+  }} | Select-Object -First 1
+  if ($match) {{
+    $targetHandle = $match.MainWindowHandle
+  }}
+}}
+
+$activated = $false
+if ($targetHandle -ne [System.IntPtr]::Zero) {{
+  if ([Asi.NativeWin]::IsIconic($targetHandle)) {{
+    # Restore if the window is minimized (SW_RESTORE = 9).
+    [void][Asi.NativeWin]::ShowWindow($targetHandle, 9)
+  }}
+  $activated = [Asi.NativeWin]::SetForegroundWindow($targetHandle)
+  # Small settle delay so Windows can actually finish the focus swap
+  # before keystrokes pasting begins.
+  Start-Sleep -Milliseconds 150
+}}
+
+# Paste via clipboard rather than SendKeys character-by-character.
+# Reasons:
+#   * Windows 11 Notepad (and other WinAppSDK apps) drops some characters
+#     from rapid SendKeys input, notably spaces — the silent bug we hit
+#     ("AI is writing this" -> "AIiswritingthis").
+#   * Special SendKeys chars (+ ^ % ~ ( ) {{ }}) need escaping; clipboard
+#     paste sidesteps the entire escape regime.
+#   * Non-ASCII (CJK, emoji) round-trips reliably through the clipboard.
+# We preserve the user's existing clipboard contents and restore them
+# after the paste so the tool is non-destructive to the user's clipboard.
+$text = '{text}'
+$prevClip = $null
+try {{ $prevClip = Get-Clipboard -Raw -ErrorAction SilentlyContinue }} catch {{ $prevClip = $null }}
+
+Set-Clipboard -Value $text
+Start-Sleep -Milliseconds 30
+[System.Windows.Forms.SendKeys]::SendWait('^v')
+Start-Sleep -Milliseconds 80
+
+if ($null -ne $prevClip) {{
+  try {{ Set-Clipboard -Value $prevClip }} catch {{ }}
+}}
+
+$obj = [ordered]@{{
+  typed = $true
+  length = $text.Length
+  target_window_activated = $activated
+  target_handle = ($targetHandle.ToString())
+  method = 'clipboard_paste'
+}}
+$obj | ConvertTo-Json -Compress
 "#,
-        text = esc
+        text = esc_text,
+        title = esc_title,
+        pid_literal = pid_literal,
     );
     run_windows_gui_powershell(&script)
 }
@@ -2953,7 +3075,8 @@ mod tests {
         grep_search,
         decode_key_value_text_value,
         normalize_bash_args, normalize_grep_search_args, normalize_windows_shell_command,
-        extract_key_value_string_arg, parse_click_xy_args,
+        extract_json_usize_arg, extract_key_value_string_arg, extract_key_value_usize_arg,
+        parse_click_xy_args,
         rewrite_python_dash_c_single_quoted_script, rewrite_python_herestring_for_powershell,
         rewrite_bash_group_pipe_python_for_powershell,
         run_tool,
@@ -3599,5 +3722,40 @@ name='asi'
         assert!(res.output.contains("whitespace/newlines"));
 
         let _ = fs::remove_file(path);
+    }
+
+    // Regression: type_text dispatch must accept window_pid / window_title
+    // alongside text in both JSON and key=value shapes. Without these, the
+    // SendKeys call fires at the foreground window (usually the terminal),
+    // and Notepad/browser stays empty even though the tool reports success.
+    #[test]
+    fn type_text_args_extract_window_pid_from_json_shape() {
+        let raw = r#"{"text":"hi","window_pid":12345}"#;
+        let pid = extract_json_usize_arg(raw, &["window_pid", "pid", "target_pid"]);
+        assert_eq!(pid, Some(12345));
+    }
+
+    #[test]
+    fn type_text_args_extract_window_pid_from_key_value_shape() {
+        let raw = r#"text="hi" window_pid=12345"#;
+        let pid = extract_key_value_usize_arg(raw, &["window_pid", "pid", "target_pid"]);
+        assert_eq!(pid, Some(12345));
+    }
+
+    #[test]
+    fn type_text_args_extract_window_title_aliases() {
+        let raw = r#"{"text":"hi","target":"Notepad"}"#;
+        let title = extract_json_string_arg(
+            raw,
+            &["window_title", "window", "target", "target_title"],
+        );
+        assert_eq!(title.as_deref(), Some("Notepad"));
+
+        let kv = r#"text="hi" window="Untitled - Notepad""#;
+        let title2 = extract_key_value_string_arg(
+            kv,
+            &["window_title", "window", "target", "target_title"],
+        );
+        assert_eq!(title2.as_deref(), Some("Untitled - Notepad"));
     }
 }
