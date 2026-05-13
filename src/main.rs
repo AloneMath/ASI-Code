@@ -10974,8 +10974,9 @@ pub(crate) fn looks_like_pending_action_promise(text: &str) -> bool {
         "\u{4F60}\u{53EA}\u{9700}",
         "\u{8BF7}\u{4F60}\u{6309}",
         "\u{8BF7}\u{4F60}\u{6309}\u{4E0B}\u{9762}",
-        "\u{6211}\u{4F1A}\u{5148}",
-        "\u{6211}\u{5148}",
+        // Two CJK patterns intentionally removed here: "I will first" and
+        // "I first" — too short, would false-trigger on legitimate prose
+        // like "let me read the file first" (a sensible mid-task action).
         "\u{4E0B}\u{4E00}\u{6B65}\u{6211}\u{4F1A}",
         "\u{4E0B}\u{4E00}\u{6B65}\u{6211}\u{5C06}",
         "\u{6211}\u{9700}\u{8981}\u{4F60}\u{786E}\u{8BA4}",
