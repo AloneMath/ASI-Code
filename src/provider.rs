@@ -366,14 +366,19 @@ pub fn tool_definitions_openai() -> Value {
             "type": "function",
             "function": {
                 "name": "unity_bridge",
-                "description": "Run Python script through Unity bridge via batchmode entrypoint `PythonRunner.RunFile`.",
+                "description": "Drive a Unity project. The `action` field selects one of: `python` (default; runs Python via batchmode `PythonRunner.RunFile` — spawns a fresh headless Unity, will fail if the project is already open in another Editor), `open` (launches the Editor for the project and returns immediately; use this before csharp/create_terrain to make sure the live Editor is running), `csharp` (executes C# inside the ALREADY-RUNNING Editor by dropping a one-shot script into Assets/Editor/ and polling its result — required for interactive edits to the open scene), `create_terrain` (convenience: spawns a Terrain GameObject in the active scene, dispatches via csharp), `save` (saves open scenes + asset database, via csharp).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "script": {"type": "string", "description": "Python script source to execute"},
-                        "project": {"type": "string", "description": "Unity project path"}
+                        "project": {"type": "string", "description": "Absolute path to the Unity project root (the folder containing Assets/, Library/, ProjectSettings/)."},
+                        "action": {"type": "string", "description": "One of: python | open | csharp | create_terrain | save. Defaults to python.", "enum": ["python", "open", "csharp", "create_terrain", "save"]},
+                        "script": {"type": "string", "description": "Source code body. Python source when action=python; C# source when action=csharp (`csharp` field also accepted). Unused for open/save."},
+                        "csharp": {"type": "string", "description": "Alias for `script` when action=csharp, for clarity."},
+                        "size": {"type": "array", "items": {"type": "number"}, "description": "Terrain size [x,y,z] in world units. Only used by action=create_terrain. Defaults to [500,50,500]."},
+                        "heightmap_resolution": {"type": "integer", "description": "Heightmap resolution (33-4097) for create_terrain. Defaults to 513."},
+                        "name": {"type": "string", "description": "GameObject name for create_terrain. Defaults to AsiTerrain."}
                     },
-                    "required": ["script", "project"]
+                    "required": ["project"]
                 }
             }
         }
@@ -568,14 +573,19 @@ pub fn tool_definitions_claude() -> Value {
         },
         {
             "name": "unity_bridge",
-            "description": "Run Python script through Unity bridge via batchmode entrypoint `PythonRunner.RunFile`.",
+            "description": "Drive a Unity project. The `action` field selects one of: `python` (default; runs Python via batchmode `PythonRunner.RunFile` — spawns a fresh headless Unity, will fail if the project is already open in another Editor), `open` (launches the Editor for the project and returns immediately; use this before csharp/create_terrain to make sure the live Editor is running), `csharp` (executes C# inside the ALREADY-RUNNING Editor by dropping a one-shot script into Assets/Editor/ and polling its result — required for interactive edits to the open scene), `create_terrain` (convenience: spawns a Terrain GameObject in the active scene, dispatches via csharp), `save` (saves open scenes + asset database, via csharp).",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "script": {"type": "string", "description": "Python script source to execute"},
-                    "project": {"type": "string", "description": "Unity project path"}
+                    "project": {"type": "string", "description": "Absolute path to the Unity project root (the folder containing Assets/, Library/, ProjectSettings/)."},
+                    "action": {"type": "string", "description": "One of: python | open | csharp | create_terrain | save. Defaults to python.", "enum": ["python", "open", "csharp", "create_terrain", "save"]},
+                    "script": {"type": "string", "description": "Source code body. Python source when action=python; C# source when action=csharp (`csharp` field also accepted). Unused for open/save."},
+                    "csharp": {"type": "string", "description": "Alias for `script` when action=csharp, for clarity."},
+                    "size": {"type": "array", "items": {"type": "number"}, "description": "Terrain size [x,y,z] in world units. Only used by action=create_terrain. Defaults to [500,50,500]."},
+                    "heightmap_resolution": {"type": "integer", "description": "Heightmap resolution (33-4097) for create_terrain. Defaults to 513."},
+                    "name": {"type": "string", "description": "GameObject name for create_terrain. Defaults to AsiTerrain."}
                 },
-                "required": ["script", "project"]
+                "required": ["project"]
             }
         }
     ])

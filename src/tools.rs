@@ -13,11 +13,33 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BRIDGE_TIMEOUT_SECS_DEFAULT: u64 = 120;
 const BRIDGE_TIMEOUT_SECS_MAX: u64 = 3600;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct BridgeRequest {
+    /// Source code — interpreted as Python for ue5/blender/unity-python and
+    /// as C# for unity-csharp actions. Optional because `action: "open"`
+    /// and `action: "save"` need no source.
+    #[serde(default)]
     script: String,
+    /// Alias for `script` specifically meant for C# payloads, so the model
+    /// can be explicit about language. If both are set, `csharp` wins.
+    #[serde(default)]
+    csharp: String,
     #[serde(default)]
     project: String,
+    /// Unity-bridge dispatch keyword. Empty string = legacy "python" path.
+    /// Supported: "" / "python" / "open" / "csharp" / "create_terrain" / "save".
+    #[serde(default)]
+    action: String,
+    /// Optional terrain size as [x, y, z] in world units — only used by
+    /// action: "create_terrain". Defaults to [500.0, 50.0, 500.0].
+    #[serde(default)]
+    size: Option<Vec<f32>>,
+    /// Optional heightmap resolution (default 513) for create_terrain.
+    #[serde(default)]
+    heightmap_resolution: Option<u32>,
+    /// Optional name for created GameObjects (default "AsiTerrain").
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2429,26 +2451,34 @@ $obj | ConvertTo-Json -Compress -Depth 4
 fn parse_bridge_request(args: &str) -> Result<BridgeRequest, String> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        return Err("bridge call requires JSON args with `script`".to_string());
+        return Err("bridge call requires JSON args".to_string());
     }
 
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         let parsed: BridgeRequest =
             serde_json::from_str(trimmed).map_err(|e| format!("invalid bridge JSON args: {}", e))?;
-        if parsed.script.trim().is_empty() {
-            return Err("bridge `script` cannot be empty".to_string());
-        }
         return Ok(parsed);
     }
 
+    // Bare-string form: treat as a script payload (legacy behavior).
     let script = strip_surrounding_quotes(trimmed).to_string();
-    if script.trim().is_empty() {
-        return Err("bridge script cannot be empty".to_string());
-    }
     Ok(BridgeRequest {
         script,
-        project: String::new(),
+        ..BridgeRequest::default()
     })
+}
+
+/// Validate that a request carries a non-empty script for engines that
+/// can only operate in batch mode (UE5, Blender). Each engine wraps this
+/// check at its dispatch site because the validation was previously
+/// inside parse_bridge_request — moving it lets Unity accept action-
+/// based requests that legitimately have no script (open/save).
+fn require_script(req: &BridgeRequest, engine: &str) -> Result<String, String> {
+    let script = req.script.trim();
+    if script.is_empty() {
+        return Err(format!("{} requires non-empty `script`", engine));
+    }
+    Ok(script.to_string())
 }
 
 fn bridge_timeout_secs() -> u64 {
@@ -2599,8 +2629,12 @@ pub fn ue5_bridge(args: &str) -> ToolResult {
         Ok(v) => v,
         Err(e) => return ToolResult::err(e),
     };
+    let script = match require_script(&req, "ue5_bridge") {
+        Ok(s) => s,
+        Err(e) => return ToolResult::err(e),
+    };
     let script_file = unique_bridge_file("ue5", "py");
-    if let Err(e) = fs::write(&script_file, req.script) {
+    if let Err(e) = fs::write(&script_file, script) {
         return finalize_bridge_result(
             "ue5_bridge",
             false,
@@ -2634,8 +2668,12 @@ pub fn blender_bridge(args: &str) -> ToolResult {
         Ok(v) => v,
         Err(e) => return ToolResult::err(e),
     };
+    let script = match require_script(&req, "blender_bridge") {
+        Ok(s) => s,
+        Err(e) => return ToolResult::err(e),
+    };
     let script_file = unique_bridge_file("blender", "py");
-    if let Err(e) = fs::write(&script_file, req.script) {
+    if let Err(e) = fs::write(&script_file, script) {
         return finalize_bridge_result(
             "blender_bridge",
             false,
@@ -2669,8 +2707,37 @@ pub fn unity_bridge(args: &str) -> ToolResult {
             "unity_bridge requires `project` in args JSON".to_string(),
         );
     }
+    let action = req.action.trim().to_ascii_lowercase();
+    match action.as_str() {
+        "" | "python" => unity_bridge_python(&req, project),
+        "open" => unity_bridge_open(project),
+        "csharp" | "c#" | "execute_csharp" => unity_bridge_csharp(&req, project),
+        "create_terrain" => unity_bridge_create_terrain(&req, project),
+        "save" => unity_bridge_save(project),
+        other => finalize_bridge_result(
+            "unity_bridge",
+            false,
+            format!(
+                "unknown unity_bridge action: {} (expected: python | open | csharp | create_terrain | save)",
+                other
+            ),
+        ),
+    }
+}
+
+fn unity_bin() -> String {
+    std::env::var("ASI_UNITY_EDITOR")
+        .or_else(|_| std::env::var("UNITY_EDITOR"))
+        .unwrap_or_else(|_| "Unity".to_string())
+}
+
+fn unity_bridge_python(req: &BridgeRequest, project: &str) -> ToolResult {
+    let script = match require_script(req, "unity_bridge action=python") {
+        Ok(s) => s,
+        Err(e) => return ToolResult::err(e),
+    };
     let script_file = unique_bridge_file("unity", "py");
-    if let Err(e) = fs::write(&script_file, req.script) {
+    if let Err(e) = fs::write(&script_file, script) {
         return finalize_bridge_result(
             "unity_bridge",
             false,
@@ -2678,10 +2745,7 @@ pub fn unity_bridge(args: &str) -> ToolResult {
         );
     }
 
-    let unity_bin = std::env::var("ASI_UNITY_EDITOR")
-        .or_else(|_| std::env::var("UNITY_EDITOR"))
-        .unwrap_or_else(|_| "Unity".to_string());
-    let mut cmd = Command::new(unity_bin);
+    let mut cmd = Command::new(unity_bin());
     cmd.arg("-batchmode")
         .arg("-nographics")
         .arg("-quit")
@@ -2695,6 +2759,253 @@ pub fn unity_bridge(args: &str) -> ToolResult {
     let res = run_bridge_command("unity_bridge", cmd, bridge_timeout_secs());
     let _ = fs::remove_file(&script_file);
     res
+}
+
+/// `action: "open"` — spawn the Unity Editor for `project` and return
+/// immediately without waiting. If Unity is already running (and Unity
+/// Hub is active), Hub will focus the existing instance instead of
+/// launching a duplicate. Useful as a "just bring the editor up" call
+/// before other tools poke at the project.
+fn unity_bridge_open(project: &str) -> ToolResult {
+    let mut cmd = Command::new(unity_bin());
+    cmd.arg("-projectPath").arg(project);
+    // Detach: don't pipe stdio, don't wait.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(child) => finalize_bridge_result(
+            "unity_bridge",
+            true,
+            format!(
+                "launched Unity for project '{}' (pid={}); editor will appear shortly",
+                project,
+                child.id()
+            ),
+        ),
+        Err(e) => finalize_bridge_result(
+            "unity_bridge",
+            false,
+            format!("failed to launch Unity (set ASI_UNITY_EDITOR to override binary path): {}", e),
+        ),
+    }
+}
+
+/// `action: "csharp"` — execute a snippet of C# inside the **already-
+/// running** Unity Editor. Approach: write a tiny Editor script to
+/// `<project>/Assets/Editor/AsiOneshot_<NONCE>.cs` that uses
+/// `[InitializeOnLoadMethod]` so Unity auto-compiles and invokes it
+/// after the next domain reload. The script writes "OK\n<msg>" or
+/// "ERR\n<exception>" to a unique result file, which this function
+/// polls until present or timeout.
+///
+/// This is the only way to drive the live editor without an extra IPC
+/// daemon: Unity's own asset pipeline is the IPC channel.
+fn unity_bridge_csharp(req: &BridgeRequest, project: &str) -> ToolResult {
+    let user_code = if !req.csharp.trim().is_empty() {
+        req.csharp.trim().to_string()
+    } else if !req.script.trim().is_empty() {
+        req.script.trim().to_string()
+    } else {
+        return ToolResult::err(
+            "unity_bridge action=csharp requires `csharp` or `script` with C# source".to_string(),
+        );
+    };
+    run_unity_csharp_oneshot(project, &user_code)
+}
+
+/// `action: "create_terrain"` — convenience wrapper that generates the
+/// C# to spawn a Terrain GameObject in the active scene and dispatches
+/// to `unity_bridge_csharp`. Defaults to 500x50x500 with heightmap
+/// resolution 513, all configurable via the request.
+fn unity_bridge_create_terrain(req: &BridgeRequest, project: &str) -> ToolResult {
+    let size = req.size.clone().unwrap_or_else(|| vec![500.0, 50.0, 500.0]);
+    let (sx, sy, sz) = match size.as_slice() {
+        [x, y, z] => (*x, *y, *z),
+        _ => return ToolResult::err(
+            "unity_bridge action=create_terrain requires `size` as [x,y,z] (or omit for default)"
+                .to_string(),
+        ),
+    };
+    let resolution = req.heightmap_resolution.unwrap_or(513).clamp(33, 4097);
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("AsiTerrain");
+    let cs_escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+    let csharp = format!(
+        r#"
+var go = new GameObject("{name}");
+var td = new TerrainData();
+td.heightmapResolution = {res};
+td.size = new Vector3({sx}f, {sy}f, {sz}f);
+var terrain = go.AddComponent<Terrain>();
+terrain.terrainData = td;
+var collider = go.AddComponent<TerrainCollider>();
+collider.terrainData = td;
+UnityEditor.Selection.activeGameObject = go;
+UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(
+    UnityEngine.SceneManagement.SceneManager.GetActiveScene());
+UnityEngine.Debug.Log("AsiTerrain created: name={name} size=({sx},{sy},{sz}) res={res}");
+"#,
+        name = cs_escaped_name,
+        res = resolution,
+        sx = sx,
+        sy = sy,
+        sz = sz,
+    );
+    run_unity_csharp_oneshot(project, &csharp)
+}
+
+/// `action: "save"` — saves the active scene + AssetDatabase. Useful
+/// after a chain of create_terrain / csharp calls so the changes are
+/// durable on disk.
+fn unity_bridge_save(project: &str) -> ToolResult {
+    let csharp = r#"
+UnityEditor.SceneManagement.EditorSceneManager.SaveOpenScenes();
+UnityEditor.AssetDatabase.SaveAssets();
+UnityEditor.AssetDatabase.Refresh();
+UnityEngine.Debug.Log("Asi save: open scenes saved + asset db refreshed");
+"#;
+    run_unity_csharp_oneshot(project, csharp)
+}
+
+/// Build the `Assets/Editor/AsiOneshot_<NONCE>.cs` script that wraps
+/// `user_code` in an `[InitializeOnLoadMethod]` hook, drop it into the
+/// project so Unity's running compiler picks it up, and poll for the
+/// result marker file the generated script writes.
+///
+/// The generated script self-cleans via `EditorApplication.delayCall`
+/// after writing the result file so the project doesn't accumulate
+/// AsiOneshot_*.cs entries across calls.
+fn run_unity_csharp_oneshot(project: &str, user_code: &str) -> ToolResult {
+    let editor_dir = Path::new(project).join("Assets").join("Editor");
+    if let Err(e) = fs::create_dir_all(&editor_dir) {
+        return finalize_bridge_result(
+            "unity_bridge",
+            false,
+            format!(
+                "failed to ensure Assets/Editor exists under '{}': {}",
+                project, e
+            ),
+        );
+    }
+
+    // Unique class name AND unique result file per call. Use process id +
+    // millis since epoch; same scheme as unique_bridge_file but inlined
+    // because we need the bare nonce string for the C# class name.
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pid = std::process::id();
+    let nonce = format!("{}_{}", pid, ts);
+    let class_name = format!("AsiOneshot_{}", nonce);
+    let script_path = editor_dir.join(format!("{}.cs", class_name));
+    let result_path = std::env::temp_dir().join(format!("asi_unity_csharp_{}.txt", nonce));
+
+    // Build the C# file. Escape user-code-unsafe sequences? The user
+    // code is C# source verbatim — we inject it inside a `try` block.
+    // The result_path is encoded as a verbatim string literal (@"...")
+    // with embedded double-quotes doubled per C# rules.
+    let result_path_lit = result_path
+        .to_string_lossy()
+        .replace('"', "\"\"");
+    let script_path_for_delete = format!("Assets/Editor/{}.cs", class_name);
+    let cs = format!(
+        r#"// Auto-generated by ASI Code unity_bridge. Safe to delete.
+using UnityEditor;
+using UnityEngine;
+using System.IO;
+
+[InitializeOnLoad]
+public static class {class_name} {{
+    static {class_name}() {{
+        var resultPath = @"{result_lit}";
+        try {{
+            {user_code}
+            File.WriteAllText(resultPath, "OK\n");
+        }} catch (System.Exception e) {{
+            File.WriteAllText(resultPath, "ERR\n" + e.ToString());
+        }}
+        EditorApplication.delayCall += () => {{
+            try {{ AssetDatabase.DeleteAsset("{asset_path}"); }} catch {{ }}
+        }};
+    }}
+}}
+"#,
+        class_name = class_name,
+        result_lit = result_path_lit,
+        user_code = user_code,
+        asset_path = script_path_for_delete,
+    );
+
+    if let Err(e) = fs::write(&script_path, cs) {
+        return finalize_bridge_result(
+            "unity_bridge",
+            false,
+            format!(
+                "failed to write oneshot C# script '{}': {}",
+                script_path.display(),
+                e
+            ),
+        );
+    }
+
+    // Poll. The Editor needs time to notice the new file, queue
+    // compilation, finish the domain reload, and let our static
+    // constructor run. Default budget 60s; override with
+    // ASI_BRIDGE_TIMEOUT_SECS.
+    let timeout = Duration::from_secs(bridge_timeout_secs());
+    let started = Instant::now();
+    let poll_interval = Duration::from_millis(500);
+    let body = loop {
+        if result_path.exists() {
+            match fs::read_to_string(&result_path) {
+                Ok(text) => break Some(text),
+                Err(e) => break Some(format!("ERR\nfailed to read result file: {}", e)),
+            }
+        }
+        if started.elapsed() >= timeout {
+            break None;
+        }
+        thread::sleep(poll_interval);
+    };
+
+    // Cleanup result file (script file is cleaned by the Editor via
+    // delayCall; if Unity isn't running we attempt a best-effort
+    // delete here too so we don't leak compile-errors into the project).
+    let _ = fs::remove_file(&result_path);
+
+    match body {
+        Some(text) => {
+            let ok = text.starts_with("OK");
+            finalize_bridge_result("unity_bridge", ok, text.trim().to_string())
+        }
+        None => {
+            // Timed out. We intentionally leave the dropped .cs in
+            // place: if Unity wasn't running yet, opening it later will
+            // still trigger compilation, run our [InitializeOnLoad]
+            // hook, and the hook's own EditorApplication.delayCall
+            // self-deletes the file. Removing the .cs here would
+            // discard that recovery path. Trade-off: a stale script
+            // sits at <project>/Assets/Editor/AsiOneshot_<NONCE>.cs
+            // until Unity opens the project. That's a known artifact
+            // and is documented in the timeout message below.
+            finalize_bridge_result(
+                "unity_bridge",
+                false,
+                format!(
+                    "C# oneshot timed out after {}s; verify the Unity Editor is open on '{}' (run unity_bridge action=open first) and that compilation isn't blocked by errors in Assets/. The script was dropped at '{}' and will run on next Editor load.",
+                    timeout.as_secs(),
+                    project,
+                    script_path.display(),
+                ),
+            )
+        }
+    }
 }
 
 pub fn bash(command: &str) -> ToolResult {
@@ -3089,6 +3400,7 @@ mod tests {
         windows_connect_timeout_error, windows_file_exists_path, windows_missing_path_error_path,
         windows_missing_yarn_error, windows_permission_error, extract_json_string_arg,
         windows_python_alias_error, windows_shell_error_hint,
+        parse_bridge_request, require_script, unity_bridge, BridgeRequest,
     };
     use std::env;
     use std::fs;
@@ -3757,5 +4069,132 @@ name='asi'
             &["window_title", "window", "target", "target_title"],
         );
         assert_eq!(title2.as_deref(), Some("Untitled - Notepad"));
+    }
+
+    // unity_bridge action dispatch — these cover the parser surface and
+    // the error paths we can hit without an actual Unity install.
+
+    #[test]
+    fn parse_bridge_request_no_longer_requires_script_for_action_open() {
+        let raw = r#"{"project":"D:/u/p","action":"open"}"#;
+        let req = parse_bridge_request(raw).expect("parse ok");
+        assert_eq!(req.action, "open");
+        assert_eq!(req.project, "D:/u/p");
+        assert!(req.script.is_empty());
+    }
+
+    #[test]
+    fn parse_bridge_request_accepts_csharp_alias_field() {
+        let raw = r#"{"project":"D:/u/p","action":"csharp","csharp":"Debug.Log(\"hi\");"}"#;
+        let req = parse_bridge_request(raw).expect("parse ok");
+        assert_eq!(req.action, "csharp");
+        assert_eq!(req.csharp, "Debug.Log(\"hi\");");
+    }
+
+    #[test]
+    fn parse_bridge_request_carries_terrain_size_array() {
+        let raw = r#"{"project":"D:/u/p","action":"create_terrain","size":[600,40,600]}"#;
+        let req = parse_bridge_request(raw).expect("parse ok");
+        assert_eq!(req.size.as_deref(), Some(&[600.0, 40.0, 600.0][..]));
+    }
+
+    #[test]
+    fn require_script_rejects_empty_for_batch_engines() {
+        let req = BridgeRequest::default();
+        let err = require_script(&req, "blender_bridge").unwrap_err();
+        assert!(err.contains("blender_bridge"));
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn unity_bridge_rejects_missing_project() {
+        // No `project` -> early error, regardless of action.
+        let res = unity_bridge(r#"{"action":"open"}"#);
+        assert!(!res.ok);
+        assert!(res.output.contains("project"));
+    }
+
+    #[test]
+    fn unity_bridge_rejects_unknown_action() {
+        let res = unity_bridge(
+            r#"{"project":"D:/u/p","action":"deploy_to_steam"}"#,
+        );
+        assert!(!res.ok);
+        assert!(
+            res.output.contains("unknown unity_bridge action"),
+            "{}",
+            res.output
+        );
+        assert!(res.output.contains("deploy_to_steam"), "{}", res.output);
+    }
+
+    #[test]
+    fn unity_bridge_csharp_requires_source() {
+        let res = unity_bridge(r#"{"project":"D:/u/p","action":"csharp"}"#);
+        assert!(!res.ok);
+        assert!(res.output.contains("csharp"), "{}", res.output);
+    }
+
+    // create_terrain with default size shouldn't error on arg validation —
+    // it'll only fail later when it tries to write into a real project
+    // path. So we point at a temp dir that we create.
+    #[test]
+    fn unity_bridge_create_terrain_writes_oneshot_script_into_assets_editor() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let project = env::temp_dir().join(format!("asi_unity_fake_{}", ts));
+        fs::create_dir_all(&project).expect("mkdir project");
+
+        // Set a 2s timeout — Unity won't be running on this fake project,
+        // so the call will time out, but the .cs file should have been
+        // written to Assets/Editor/ before the timeout.
+        env::set_var("ASI_BRIDGE_TIMEOUT_SECS", "2");
+
+        let args = format!(
+            r#"{{"project":"{}","action":"create_terrain","size":[100,10,100],"name":"TestTerrain"}}"#,
+            project.to_string_lossy().replace('\\', "/")
+        );
+        let res = unity_bridge(&args);
+
+        // Timed out as expected. Check the script was written.
+        assert!(!res.ok, "expected timeout result: {}", res.output);
+        let editor_dir = project.join("Assets").join("Editor");
+        assert!(editor_dir.exists(), "Assets/Editor should be created");
+        let entries: Vec<_> = fs::read_dir(&editor_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("AsiOneshot_")
+                && e.file_name().to_string_lossy().ends_with(".cs")),
+            "expected AsiOneshot_*.cs in {}, found: {:?}",
+            editor_dir.display(),
+            entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+
+        // Verify the generated C# contains the user-facing identifiers
+        // and the terrain dimensions we requested.
+        let cs_entry = entries
+            .iter()
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("AsiOneshot_")
+            })
+            .unwrap();
+        let cs_text = fs::read_to_string(cs_entry.path()).unwrap();
+        assert!(cs_text.contains("TestTerrain"), "C# missing name");
+        assert!(cs_text.contains("100f"), "C# missing terrain x size");
+        assert!(cs_text.contains("InitializeOnLoad"), "C# missing trigger attr");
+        assert!(cs_text.contains("new Terrain"), "C# missing Terrain construction");
+
+        // Cleanup.
+        env::remove_var("ASI_BRIDGE_TIMEOUT_SECS");
+        let _ = fs::remove_dir_all(&project);
     }
 }
