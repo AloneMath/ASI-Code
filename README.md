@@ -2,6 +2,8 @@
 
 **A modern terminal coding agent in Rust.** Single binary. No Node.js runtime required, and no npm install step. Runs against **DeepSeek**, **OpenAI**, or **Claude** with the same workflow.
 
+> **ASI Code 2.0 is coming soon.** The 2.0 line moves beyond pure code editing into desktop and professional-software control: native GUI automation (screenshot / window targeting / synthetic input / on-screen OCR), live engine bridges for Unreal Engine 5, Blender, and Unity (drive the already-open Editor via `[InitializeOnLoad]` C# drops), and a smarter auto-loop that no longer mistakes successful read-only investigation for "no progress." See [What's New in 2.0](#whats-new-in-20-preview) below.
+
 Inspired by modern coding-agent CLIs, with a similar workflow and UX: REPL with slash commands, streaming output, auto-tool loop, work / code / secure / review modes, sub-agents, MCP server support, plugin system, agent skills, cron jobs, git worktrees, sandbox + audit log, and a 60+ command surface.
 
 ```powershell
@@ -61,6 +63,72 @@ This project is independent and is not affiliated with, endorsed by, or sponsore
   - `theme` / `/theme` text style chooser with preview
   - `setup` / `/setup` API key + model + wallet setup wizard
   - `scan` / `/scan` repository pattern scan panel (auto-detects project profile: Rust/JavaScript/Python when no patterns are provided, supports deep mode: `--deep` or `--deep=N`)
+
+## What's New in 2.0 (Preview)
+
+Everything below is **already implemented and merged** on `main`; the 2.0 release is the moment we cut a numbered tag and ship signed installers. Try it from source today.
+
+### Tier 1 — Native computer-control tools
+
+A `/computer` tool family lets the agent see and drive any Windows GUI app, not just the terminal. Five tools, all available as native `tool_use` / `tool_calls` blocks and via `/toolcall`:
+
+- `screenshot` — capture the screen, return base64 PNG for vision models
+- `find_window <title>` — locate windows by title substring, returns `pid` + `MainWindowHandle` so other tools can target them precisely
+- `click <x> <y>` / `click_text "Save"` — UI Automation pointer + button click via the accessibility tree
+- `type_text` — paste arbitrary text into a target window (see below for the focus fix)
+- `read_screen_text` — full-screen OCR via Tesseract, returns extracted text
+
+`type_text` was rebuilt around two real-world bugs the naive `SendKeys` approach silently hides:
+
+- **Focus**: `SendKeys::SendWait` posts to the foreground window — without an explicit focus grab, keystrokes hit the terminal running asi-code, not the app the user wanted. `type_text` now accepts optional `window_pid` (preferred, get it from `find_window`) or `window_title`, calls `SetForegroundWindow` + `ShowWindow(SW_RESTORE)` with a 150 ms settle delay, then types.
+- **Whitespace and Unicode**: Windows 11 Notepad (WinAppSDK) silently drops space characters from rapid `SendKeys` input, and SendKeys's special-character escapes (`+ ^ % ~ ( ) { }`) break naive payloads. `type_text` now writes through the clipboard (`Set-Clipboard` + `Ctrl+V`) and restores the user's prior clipboard contents — arbitrary text round-trips byte-perfect, including CJK and emoji.
+
+### Tier 2 — Live engine bridges for professional 3D/game software
+
+Three bridges turn the CLI into a remote control for the heavy-iron creative tools that the generic computer-control approach can't drive intelligently:
+
+| Tool | Default driver | What it does |
+|---|---|---|
+| `ue5_bridge` | `UnrealEditor-Cmd.exe -ExecutePythonScript=<file>` | Runs Python in a headless Unreal Editor session for the given `.uproject`. |
+| `blender_bridge` | `blender --background --python <file>` | Runs a Python script in a headless Blender; override the binary via `ASI_BLENDER_BIN` (needed for Microsoft Store installs). |
+| `unity_bridge` | dispatched by `action` field | Five modes — see below. |
+
+`unity_bridge` is the most developed of the three. Pass `action` to pick a mode:
+
+- `python` (default) — legacy: spawn `Unity -batchmode -executeMethod PythonRunner.RunFile`, fresh headless instance per call.
+- `open` — launch the Editor for the project and return immediately. Use this before `csharp` / `create_terrain` to make sure the live Editor is running. Unity Hub focuses an existing instance instead of duplicating.
+- `csharp` — **execute C# inside the already-running Editor.** The bridge drops a one-shot `Assets/Editor/AsiOneshot_<NONCE>.cs` with an `[InitializeOnLoad]` hook, lets Unity's own compiler pick it up, polls a unique result file in `%TEMP%` for `OK\n…` or `ERR\n…`, then the script self-deletes via `EditorApplication.delayCall`. This is how you make interactive edits to the open scene without an extra IPC daemon — Unity's asset pipeline *is* the IPC channel.
+- `create_terrain` — convenience: generate the C# that spawns a `Terrain` GameObject in the active scene (size, heightmap resolution, name all configurable), dispatch via `csharp`.
+- `save` — `SaveOpenScenes()` + `SaveAssets()` + `Refresh()`, also via `csharp`.
+
+Example:
+
+```text
+/toolcall unity_bridge {"project":"D:/unity/My project","action":"open"}
+/toolcall unity_bridge {"project":"D:/unity/My project","action":"create_terrain","name":"ParkourTerrain","size":[500,50,500]}
+/toolcall unity_bridge {"project":"D:/unity/My project","action":"csharp","csharp":"var c = GameObject.CreatePrimitive(PrimitiveType.Cube); c.transform.position = new Vector3(10,5,10);"}
+/toolcall unity_bridge {"project":"D:/unity/My project","action":"save"}
+```
+
+Bridge environment variables:
+
+- `ASI_UE5_EDITOR` / `UE5_EDITOR` — Unreal Editor binary
+- `ASI_BLENDER_BIN` / `BLENDER_BIN` — Blender binary (set to the full path for Microsoft Store installs, e.g. `C:\Program Files\WindowsApps\BlenderFoundation.Blender_*_x64_*\Blender\blender.exe`)
+- `ASI_UNITY_EDITOR` / `UNITY_EDITOR` — Unity binary
+- `ASI_BRIDGE_TIMEOUT_SECS` — wait budget for batch calls and for the `csharp` result-file poll (default 120 s)
+
+### Auto-loop no-progress detector — read-only work now counts
+
+The auto-loop's "no progress across too many rounds" circuit breaker previously only counted **file mutations** as progress. Read-heavy tasks (screenshot, find_window, bash inspection, web_search, OCR, computer-control sequences) would trip the breaker mid-investigation even while the model was making real headway.
+
+The detector now classifies each round as one of `FilesChanged` / `ReadOnlyToolSuccess` / `Nothing`, and only the third increments the no-progress counter. The tunable cap (`ASI_AUTO_AGENT_MAX_NO_PROGRESS_ROUNDS`, default 12) is unchanged; what changed is what counts.
+
+### Roadmap
+
+- **Tier 1 (shipped):** screen capture, window targeting, click, typing, on-screen OCR.
+- **Tier 2 (shipped):** UE5 / Blender / Unity bridges; Unity has live-editor C# drop.
+- **Tier 3 (next):** mobile and cross-device remote — a small relay so the CLI can be triggered from a phone or another machine.
+- **Tier 4 (deliberately not pursued in 2.0):** AGI-level autonomous creative work. The bridge layer is the leverage — when the underlying models get stronger, every existing bridge inherits the new capability automatically.
 
 ## Quick Start
 
