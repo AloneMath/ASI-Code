@@ -23,7 +23,20 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
     let inline_calling_normalized = normalize_inline_angle_calling_blocks(&cjk_bracket_normalized);
     let calling_normalized = normalize_calling_markdown_blocks(&inline_calling_normalized);
     let dsml_normalized = normalize_dsml_fenced_tags(&calling_normalized);
-    let normalized = strip_markdown_fences(&dsml_normalized);
+    // Convert DeepSeek-v4-Pro multi-line `<TAG ... content="<<<CONTENT\n...
+    // \n<<<END"/>` and `<TAG ... content="""\n...\n"""/>` shapes into the
+    // canonical `/toolcall write_file path=... <<<CONTENT\n...\n<<<END`
+    // form before the downstream parsers see them. Without this pass the
+    // multi-line content gets silently dropped (heredoc-in-attr form) or
+    // truncated at the first inner `"""` (triple-quote form).
+    let xml_multiline_content_normalized =
+        normalize_xml_attr_multiline_content(&dsml_normalized);
+    // Map `<file ...>` aliases to canonical tool tags based on attribute
+    // shape: with content → write_file; with old_text/new_text → edit_file;
+    // otherwise (path-only or with start_line/max_lines) → read_file. The
+    // model often shortens "read_file"/"write_file" to plain "file".
+    let file_alias_normalized = normalize_file_tag_aliases(&xml_multiline_content_normalized);
+    let normalized = strip_markdown_fences(&file_alias_normalized);
     let with_tool_argument_pairs = normalize_tool_argument_pairs(&normalized);
     let preexpanded = normalize_tag_style_toolcalls(&with_tool_argument_pairs);
     let lines: Vec<&str> = preexpanded.lines().collect();
@@ -649,6 +662,315 @@ fn parse_arguments_line(line: &str) -> Option<String> {
 ///   `<｜DSML｜invoke name="glob_search">`
 ///   `<｜DSML｜parameter name="pattern" string="true">**/*.py</｜DSML｜parameter>`
 ///
+/// Tags the model uses as aliases for read_file / write_file / edit_file.
+/// Order matters only for the `file_write` / `file_edit` legacy spellings
+/// — the canonical pass `normalize_tag_tool_name` already handles those,
+/// so this list just covers the short `file` form. We resolve `<file>`
+/// based on its attribute shape (see `normalize_file_tag_aliases`).
+const FILE_TAG_ALIASES: &[&str] = &["file"];
+
+/// XML-style tags the model uses as a write_file/edit_file body wrapper.
+/// We treat all of these as potential write/edit when they carry the
+/// content/old_text/new_text attributes the model invents.
+const WRITE_LIKE_TAGS: &[&str] = &["file", "write_file", "file_write"];
+const EDIT_LIKE_TAGS: &[&str] = &["edit_file", "file_edit"];
+
+/// Rewrite `<file ...>` opening tags into the canonical `<read_file ...>`,
+/// `<write_file ...>`, or `<edit_file ...>` form based on which
+/// attributes are present. The model frequently shortens to plain
+/// `<file>` and the downstream `parse_open_tag` rejects unknown tag
+/// names — silently dropping the call.
+///
+/// Resolution rules:
+/// - has `content=` → `<write_file>`
+/// - has `old_text=` or `new_text=` → `<edit_file>`
+/// - otherwise (path-only, start_line, max_lines, etc.) → `<read_file>`
+///
+/// We rewrite ONLY the tag name on a single line; attributes pass
+/// through untouched, including any half-opened `content="<<<CONTENT`
+/// that downstream `normalize_xml_attr_multiline_content` will pick up.
+fn normalize_file_tag_aliases(text: &str) -> String {
+    if !text.contains('<') {
+        return text.to_string();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        out.push(rewrite_file_tag_alias_on_line(line));
+    }
+    out.join("\n")
+}
+
+fn rewrite_file_tag_alias_on_line(line: &str) -> String {
+    let trimmed_start = line.trim_start();
+    if !trimmed_start.starts_with('<') {
+        return line.to_string();
+    }
+    // Skip closing tags.
+    if trimmed_start.starts_with("</") {
+        return line.to_string();
+    }
+    // Find the tag name token after '<'.
+    let after_lt = &trimmed_start[1..];
+    let name_end = after_lt
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(after_lt.len());
+    if name_end == 0 {
+        return line.to_string();
+    }
+    let raw_name = &after_lt[..name_end];
+    let lower = raw_name.to_ascii_lowercase();
+    if !FILE_TAG_ALIASES.iter().any(|n| *n == lower) {
+        return line.to_string();
+    }
+    // Decide based on attributes present in the rest of the line.
+    let attrs_part = &after_lt[name_end..];
+    let attrs_lower = attrs_part.to_ascii_lowercase();
+    let canonical = if attrs_lower.contains("content=") || attrs_lower.contains("content =") {
+        "write_file"
+    } else if attrs_lower.contains("old_text=")
+        || attrs_lower.contains("new_text=")
+        || attrs_lower.contains("oldtext=")
+        || attrs_lower.contains("newtext=")
+    {
+        "edit_file"
+    } else {
+        "read_file"
+    };
+    // Reconstruct: leading whitespace + < + canonical + remainder.
+    let leading_len = line.len() - trimmed_start.len();
+    let (leading, _) = line.split_at(leading_len);
+    let remainder = &after_lt[name_end..];
+    format!("{}<{}{}", leading, canonical, remainder)
+}
+
+/// Rewrites multi-line XML-with-content-attribute patterns DeepSeek-style
+/// models emit instead of `/toolcall`. Two specific shapes are picked up:
+///
+///   <write_file path="X.py" content="<<<CONTENT
+///   line1
+///   line2
+///   <<<END"/>
+///
+///   <write_file path="X.py" content="""
+///   line1
+///   line2
+///   """/>
+///
+/// Both get rewritten to the canonical heredoc form the downstream
+/// pipeline already understands:
+///
+///   /toolcall write_file path="X.py" <<<CONTENT
+///   line1
+///   line2
+///   <<<END
+///
+/// Without this pass, the heredoc-in-attribute form gets silently
+/// dropped (the multi-line content is treated as prose and no call
+/// fires), and the triple-quote form gets truncated at the first inner
+/// `"""` inside Python docstrings. Both were observed in real DeepSeek
+/// v4 Pro REPL sessions corrupting multi-hundred-line file writes.
+fn normalize_xml_attr_multiline_content(text: &str) -> String {
+    // Cheap reject: no tag start at all.
+    if !text.contains('<') {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(rewrite) =
+            try_rewrite_xml_content_block(&lines, i)
+        {
+            out.push(rewrite.text);
+            i = rewrite.consumed_until;
+            continue;
+        }
+        out.push(line.to_string());
+        i += 1;
+    }
+    out.join("\n")
+}
+
+struct XmlContentRewrite {
+    text: String,
+    consumed_until: usize, // exclusive end index in lines[]
+}
+
+fn try_rewrite_xml_content_block(
+    lines: &[&str],
+    start: usize,
+) -> Option<XmlContentRewrite> {
+    let line = lines[start];
+    let trimmed_start = line.trim_start();
+    if !trimmed_start.starts_with('<') {
+        return None;
+    }
+    // Tag name token.
+    let after_lt = &trimmed_start[1..];
+    let name_end = after_lt
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(after_lt.len());
+    if name_end == 0 {
+        return None;
+    }
+    let raw_name = &after_lt[..name_end];
+    let lower = raw_name.to_ascii_lowercase();
+    let canonical = if WRITE_LIKE_TAGS.iter().any(|n| *n == lower) {
+        "write_file"
+    } else if EDIT_LIKE_TAGS.iter().any(|n| *n == lower) {
+        "edit_file"
+    } else {
+        return None;
+    };
+    // Locate `content="<<<CONTENT` or `content="""` opener on this line.
+    let attrs_part = &after_lt[name_end..];
+    let content_open_idx = find_content_open(attrs_part)?;
+    // Anchor: everything before `content=` is "other attrs" we preserve.
+    let attrs_before = attrs_part[..content_open_idx.attr_start].trim();
+    // Determine terminator and any inline body that follows the opener
+    // on the same physical line.
+    let inline_after_opener = &attrs_part[content_open_idx.body_start..];
+    let terminator = content_open_idx.terminator;
+
+    // Scan body lines. We accept the close on the same line OR on a
+    // subsequent line.
+    let (body, end_line) = collect_content_body(lines, start, inline_after_opener, terminator)?;
+
+    // Build canonical heredoc /toolcall.
+    let mut rewrite = String::new();
+    rewrite.push_str("/toolcall ");
+    rewrite.push_str(canonical);
+    if !attrs_before.is_empty() {
+        rewrite.push(' ');
+        rewrite.push_str(attrs_before);
+    }
+    rewrite.push_str(" <<<CONTENT\n");
+    rewrite.push_str(&body);
+    if !body.ends_with('\n') {
+        rewrite.push('\n');
+    }
+    rewrite.push_str("<<<END");
+
+    Some(XmlContentRewrite {
+        text: rewrite,
+        consumed_until: end_line + 1,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentTerminator {
+    HeredocEnd, // <<<END"/> or <<<END">
+    TripleQuote, // """/> or """>
+}
+
+struct ContentOpener {
+    attr_start: usize, // index of `c` in `content=`
+    body_start: usize, // index where body content begins (after marker)
+    terminator: ContentTerminator,
+}
+
+fn find_content_open(attrs: &str) -> Option<ContentOpener> {
+    // We look for `content=<marker>` where marker is either `"<<<CONTENT`
+    // or `"""`. The match must be case-insensitive on the attribute
+    // name but the marker is case-sensitive (it's our own protocol).
+    let lower = attrs.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find("content") {
+        let abs = search_from + rel;
+        // Verify the next non-space char is '='.
+        let after_name = &attrs[abs + "content".len()..];
+        let after_trim = after_name.trim_start();
+        if !after_trim.starts_with('=') {
+            search_from = abs + "content".len();
+            continue;
+        }
+        // Skip past '=' and any whitespace.
+        let eq_offset = after_name.len() - after_trim.len() + 1;
+        let after_eq = &after_name[eq_offset..];
+        let value_start_rel = after_eq.len() - after_eq.trim_start().len();
+        let value = &after_eq[value_start_rel..];
+
+        // Check the two recognized opener markers in priority order.
+        if let Some(rest) = value.strip_prefix("\"<<<CONTENT") {
+            // Body starts after `"<<<CONTENT` and any immediate newline.
+            let consumed = value.len() - rest.len();
+            let body_start = abs + "content".len() + eq_offset + value_start_rel + consumed;
+            return Some(ContentOpener {
+                attr_start: abs,
+                body_start,
+                terminator: ContentTerminator::HeredocEnd,
+            });
+        }
+        if let Some(rest) = value.strip_prefix("\"\"\"") {
+            let consumed = value.len() - rest.len();
+            let body_start = abs + "content".len() + eq_offset + value_start_rel + consumed;
+            return Some(ContentOpener {
+                attr_start: abs,
+                body_start,
+                terminator: ContentTerminator::TripleQuote,
+            });
+        }
+        // Not one of our recognized openers — let downstream handle.
+        return None;
+    }
+    None
+}
+
+fn collect_content_body(
+    lines: &[&str],
+    start: usize,
+    inline_after_opener: &str,
+    terminator: ContentTerminator,
+) -> Option<(String, usize)> {
+    // Check whether the close is already on this line (single-line case).
+    let close_markers: &[&str] = match terminator {
+        ContentTerminator::HeredocEnd => &["<<<END\"/>", "<<<END\">"],
+        ContentTerminator::TripleQuote => &["\"\"\"/>", "\"\"\">"],
+    };
+    if let Some(idx) = first_match(inline_after_opener, close_markers) {
+        let body = inline_after_opener[..idx].trim_start_matches('\n');
+        return Some((body.to_string(), start));
+    }
+    // Multi-line. Strip a leading newline if the opener was at end-of-line.
+    let mut body_lines: Vec<String> = Vec::new();
+    let first_chunk = inline_after_opener.trim_start_matches('\n');
+    if !first_chunk.is_empty() {
+        body_lines.push(first_chunk.to_string());
+    }
+    let mut j = start + 1;
+    while j < lines.len() {
+        let ln = lines[j];
+        if let Some(idx) = first_match(ln, close_markers) {
+            let prefix = &ln[..idx];
+            // Drop trailing whitespace before the marker, but keep the
+            // body content as-is otherwise.
+            let prefix_trimmed = prefix.trim_end();
+            if !prefix_trimmed.is_empty() {
+                body_lines.push(prefix_trimmed.to_string());
+            }
+            return Some((body_lines.join("\n"), j));
+        }
+        body_lines.push(ln.to_string());
+        j += 1;
+    }
+    // Open without close — refuse to rewrite so we don't eat user prose.
+    None
+}
+
+fn first_match(haystack: &str, needles: &[&str]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for n in needles {
+        if let Some(idx) = haystack.find(n) {
+            best = Some(match best {
+                Some(prev) if prev <= idx => prev,
+                _ => idx,
+            });
+        }
+    }
+    best
+}
+
 /// Strip the `｜DSML｜` and the trailing-fence variant (`</｜DSML｜...>`)
 /// so the line becomes ordinary `<tool_calls>` / `<invoke>` /
 /// `<parameter ...>` markup. Then alias `<tool_calls>` to the
@@ -3291,6 +3613,128 @@ mod tests {
             calls[0].args.contains("AI is writing this"),
             "args should carry the text: {}",
             calls[0].args
+        );
+    }
+
+    // Wormhole-trace regression #1: DeepSeek v4 Pro emits
+    //   <file path="X.py" content="<<<CONTENT\nLINES\n<<<END"/>
+    // multi-line. Previously dropped silently (zero tool calls).
+    #[test]
+    fn promotes_xml_file_tag_with_heredoc_content_to_write_file() {
+        let text = concat!(
+            "<file path=\"D:\\test_code\\wormhole.py\" content=\"<<<CONTENT\n",
+            "import numpy as np\n",
+            "x = np.zeros(5)\n",
+            "print(x)\n",
+            "<<<END\"/>",
+        );
+        let calls = extract_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly 1 write_file call, got {:?}",
+            calls
+        );
+        assert_eq!(calls[0].name, "write_file");
+        assert!(
+            calls[0].args.contains("wormhole.py"),
+            "path missing: {}",
+            calls[0].args
+        );
+        assert!(
+            calls[0].args.contains("import numpy as np"),
+            "body line 1 missing: {}",
+            calls[0].args
+        );
+        assert!(
+            calls[0].args.contains("print(x)"),
+            "body line 3 missing: {}",
+            calls[0].args
+        );
+        assert!(
+            calls[0].args.contains("<<<CONTENT") && calls[0].args.contains("<<<END"),
+            "heredoc markers missing: {}",
+            calls[0].args
+        );
+    }
+
+    // Wormhole-trace regression #2: DeepSeek emits Python triple-quote
+    //   <write_file path="X.py" content="""...""""/>
+    // Previously truncated at the first inner `"""` of any docstring.
+    #[test]
+    fn promotes_xml_write_file_with_triple_quote_content() {
+        // The body itself contains an inner Python docstring (triple
+        // quotes) — those must NOT be treated as the terminator. The
+        // terminator is `"""/>` exactly.
+        let text = concat!(
+            "<write_file path=\"D:\\test_code\\a.py\" content=\"\"\"\n",
+            "def f():\n",
+            "    return 1\n",
+            "\n",
+            "x = 42\n",
+            "\"\"\"/>",
+        );
+        let calls = extract_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected 1 write_file call, got {:?}",
+            calls
+        );
+        assert_eq!(calls[0].name, "write_file");
+        assert!(calls[0].args.contains("a.py"));
+        assert!(
+            calls[0].args.contains("def f():"),
+            "body fn missing: {}",
+            calls[0].args
+        );
+        assert!(
+            calls[0].args.contains("x = 42"),
+            "body tail missing: {}",
+            calls[0].args
+        );
+    }
+
+    // Wormhole-trace regression #3: short `<file>` alias for read_file
+    // (path-only or with start_line / max_lines).
+    #[test]
+    fn promotes_xml_file_tag_with_read_attrs_to_read_file() {
+        let text = "<file path=\"D:\\test_code\\sessions\\latest.json\" start_line=\"1\" max_lines=\"50\"/>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "expected 1 read_file call, got {:?}", calls);
+        assert_eq!(calls[0].name, "read_file");
+        assert!(calls[0].args.contains("latest.json"));
+        assert!(calls[0].args.contains("start_line"));
+        assert!(calls[0].args.contains("max_lines"));
+    }
+
+    // Wormhole-trace regression #4: `<file>` with only `path=` —
+    // ambiguous but read_file is the safe interpretation.
+    #[test]
+    fn promotes_xml_file_tag_path_only_to_read_file() {
+        let text = "<file path=\"D:\\test_code\\notes.md\"/>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert!(calls[0].args.contains("notes.md"));
+    }
+
+    // Defensive: an XML content block with NO matching close must NOT
+    // be rewritten — otherwise we'd swallow unrelated prose underneath.
+    #[test]
+    fn xml_content_block_without_close_is_left_alone() {
+        let text = concat!(
+            "<write_file path=\"a.py\" content=\"<<<CONTENT\n",
+            "body line 1\n",
+            "body line 2\n",
+            "(no <<<END terminator anywhere)\n",
+        );
+        let calls = extract_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            0,
+            "open-without-close must not yield a call: {:?}",
+            calls
         );
     }
 

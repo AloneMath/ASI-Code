@@ -14157,6 +14157,15 @@ fn parse_file_path_arg(args: &str) -> Option<String> {
         return normalize_file_path_token(&path);
     }
 
+    // Fallback for cases the full key=value parser refuses to handle
+    // (e.g. when `content="""..."""` later in the arg string trips it
+    // up). Scan for a literal `path="..."` or `file_path="..."` pair
+    // and extract just the quoted value. Without this, the changed_file
+    // log emits "changed_file=path=\"...\"" instead of the bare path.
+    if let Some(path) = scan_quoted_path_assignment(trimmed) {
+        return normalize_file_path_token(&path);
+    }
+
     if let Some(idx) = trimmed.find("<<<") {
         return normalize_file_path_token(&trimmed[..idx]);
     }
@@ -14187,6 +14196,35 @@ fn parse_file_path_arg(args: &str) -> Option<String> {
 
     let token = trimmed.split_whitespace().next().unwrap_or("");
     normalize_file_path_token(token)
+}
+
+/// Loose path extraction: finds `path="..."` or `file_path="..."` anywhere
+/// in `text` and returns the quoted value. Use only as a fallback when
+/// strict key=value parsing fails (typically because some other arg
+/// contains unbalanced quotes the strict parser can't handle).
+fn scan_quoted_path_assignment(text: &str) -> Option<String> {
+    for key in ["path", "file_path"] {
+        let needle = format!("{}=\"", key);
+        if let Some(start) = text.find(&needle) {
+            let value_start = start + needle.len();
+            // Stop at the next unescaped `"`.
+            let mut escaped = false;
+            for (rel_idx, ch) in text[value_start..].char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    return Some(text[value_start..value_start + rel_idx].to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn normalize_file_path_token(token: &str) -> Option<String> {
