@@ -1640,9 +1640,16 @@ fn run_repl(
 ) -> Result<(), String> {
     let _sandbox_default_guard =
         ScopedEnvVar::set_default_if_unset("ASI_SANDBOX", SAFE_PROFILE_SANDBOX_MODE);
+    let is_cubist = cfg.theme == "cubist";
+    let mut project_label: String = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     if let Some(path) = project.as_deref() {
         let switched = set_project_dir(path)?;
-        println!("project={}", switched);
+        project_label = switched.clone();
+        if !is_cubist {
+            println!("project={}", switched);
+        }
 
         let project_cfg = AppConfig::load();
         cfg.voice_enabled = project_cfg.voice_enabled;
@@ -1667,16 +1674,15 @@ fn run_repl(
     rt.extended_thinking = cfg.extended_thinking;
     apply_runtime_flags_from_cfg(&mut rt, &cfg);
 
-    if no_setup {
-        println!(
-            "{}",
-            ui.info("setup skipped (--no-setup); using current config/env")
-        );
+    let setup_msg: String = if no_setup {
+        "setup skipped (--no-setup); using current config/env".to_string()
     } else {
-        let startup_msg = run_startup_provider_wizard(&mut cfg, &mut rt, &mut ui)?;
-        println!("{}", ui.info(&startup_msg));
+        run_startup_provider_wizard(&mut cfg, &mut rt, &mut ui)?
+    };
+    if !is_cubist {
+        println!("{}", ui.info(&setup_msg));
+        println!();
     }
-    println!();
 
     let mut markdown_render = cfg.markdown_render;
     let mut auto_agent_enabled = true;
@@ -1787,23 +1793,35 @@ fn run_repl(
             ))
         );
     }
-    println!(
-        "{}",
-        ui.info("auto-agent default=on (no need to run /auto on for normal coding/chat)")
-    );
-    println!("{}", ui.info(&format!("sandbox={}", rt.sandbox_name())));
-    println!(
-        "{}",
-        ui.info(&format!(
-            "profile={}",
-            if strict_profile_enabled {
-                "strict"
-            } else {
-                "standard"
-            }
-        ))
-    );
-    println!("{}", ui.info(&format!("speed={}", execution_speed.as_str())));
+    let sandbox_label = rt.sandbox_name().to_string();
+    let profile_label = if strict_profile_enabled {
+        "strict"
+    } else {
+        "standard"
+    };
+    let speed_label = execution_speed.as_str();
+    if is_cubist {
+        println!(
+            "{}",
+            ui.startup_card(
+                &project_label,
+                &setup_msg,
+                if auto_agent_enabled { "on" } else { "off" },
+                &sandbox_label,
+                profile_label,
+                speed_label,
+            )
+        );
+        println!();
+    } else {
+        println!(
+            "{}",
+            ui.info("auto-agent default=on (no need to run /auto on for normal coding/chat)")
+        );
+        println!("{}", ui.info(&format!("sandbox={}", sandbox_label)));
+        println!("{}", ui.info(&format!("profile={}", profile_label)));
+        println!("{}", ui.info(&format!("speed={}", speed_label)));
+    }
 
     println!("{}", ui.welcome_card(&cwd));
     println!();
@@ -1999,7 +2017,7 @@ fn run_repl(
 
         if line == "/theme" {
             println!("{}", ui.theme_menu(&cfg.theme));
-            let value = prompt_input("Select style [1-6], Enter to keep")?;
+            let value = prompt_input("Select style [1-7], Enter to keep")?;
             if !value.trim().is_empty() {
                 if let Ok(idx) = value.trim().parse::<usize>() {
                     if let Some(key) = theme_from_index(idx) {
@@ -3432,7 +3450,7 @@ fn run_repl(
             };
             let result = rt.run_turn_streaming(&command, |_| {});
             if let Some((name, status, body)) = parse_tool_payload(&result.text) {
-                println!("{}", ui.tool_panel(&name, &status, &compact_tool_panel_body(&name, &status, &body)));
+                println!("{}", ui.tool_panel(&name, &status, &compact_tool_panel_body(&ui, &name, &status, &body)));
             } else {
                 let status = if result.stop_reason == "tool_result" { "result" } else { "error" };
                 println!("{}", ui.tool_panel(&tool_name, status, &result.text));
@@ -4270,20 +4288,77 @@ fn run_repl(
             model_input.clone()
         };
 
-        if !is_tool_call {
-            println!("{}", ui.spinning_line(0, 0));
-        }
+        let spinner_handle: Option<(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            std::thread::JoinHandle<()>,
+        )> = if !is_tool_call {
+            if cfg.theme == "cubist" {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_clone = std::sync::Arc::clone(&stop);
+                let start = Instant::now();
+                let theme = cfg.theme.clone();
+                print!("{}", ui.spinning_line(0, 0));
+                let _ = io::stdout().flush();
+                let handle = thread::spawn(move || {
+                    let local_ui = Ui::new(&theme);
+                    loop {
+                        thread::sleep(Duration::from_millis(200));
+                        if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let elapsed = start.elapsed().as_secs();
+                        let line = local_ui.spinning_line(elapsed, 0);
+                        print!("\r\x1b[2K{}", line);
+                        let _ = io::stdout().flush();
+                    }
+                });
+                Some((stop, handle))
+            } else {
+                println!("{}", ui.spinning_line(0, 0));
+                None
+            }
+        } else {
+            None
+        };
+        let spinner_stop_for_cb = spinner_handle.as_ref().map(|(s, _)| std::sync::Arc::clone(s));
 
+        let mut stream_filter = ui::CubistStreamFilter::new(&cfg.theme);
         let mut result = rt.run_turn_streaming(&model_input_for_runtime, |delta| {
             if !streamed {
                 streamed = true;
-                println!();
+                if let Some(flag) = &spinner_stop_for_cb {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    print!("\r\x1b[2K");
+                } else {
+                    println!();
+                }
                 print!("{} • ", ui.assistant_label());
             }
             stream_tokens += estimate_tokens(delta);
-            print!("{}", delta);
-            let _ = io::stdout().flush();
+            let mut filtered = String::new();
+            stream_filter.write(delta, &mut filtered);
+            if !filtered.is_empty() {
+                print!("{}", filtered);
+                let _ = io::stdout().flush();
+            }
         });
+        {
+            let mut tail = String::new();
+            stream_filter.flush(&mut tail);
+            if !tail.is_empty() {
+                print!("{}", tail);
+                let _ = io::stdout().flush();
+            }
+        }
+
+        if let Some((flag, handle)) = spinner_handle {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = handle.join();
+            if !streamed {
+                print!("\r\x1b[2K");
+                let _ = io::stdout().flush();
+            }
+        }
         log_interaction_event(&cfg, &rt, &model_input_for_runtime, &result);
 
         if let Some(thinking) = &result.thinking {
@@ -4308,7 +4383,7 @@ fn run_repl(
                     ui.tool_panel(
                         &nr.tool_name,
                         status,
-                        &compact_tool_panel_body(&nr.tool_name, status, &nr.result_text)
+                        &compact_tool_panel_body(&ui, &nr.tool_name, status, &nr.result_text)
                     )
                 );
             }
@@ -4319,7 +4394,7 @@ fn run_repl(
                     ui.tool_panel(
                         &name,
                         &status,
-                        &compact_tool_panel_body(&name, &status, &body)
+                        &compact_tool_panel_body(&ui, &name, &status, &body)
                     )
                 );
             } else {
@@ -4891,6 +4966,7 @@ fn theme_from_index(index: usize) -> Option<&'static str> {
         4 => Some("light-colorblind"),
         5 => Some("dark-ansi"),
         6 => Some("light-ansi"),
+        7 => Some("cubist"),
         _ => None,
     }
 }
@@ -10745,8 +10821,14 @@ fn looks_like_malformed_toolcall_output(text: &str) -> bool {
         "type_text",
         "read_screen_text",
         "ue5_bridge",
+        "ue5_scene_probe",
         "blender_bridge",
+        "blender_scene_probe",
         "unity_bridge",
+        "unity_scene_probe",
+        "probe_diff",
+        "video_capture",
+        "video_keyframes",
     ];
     let trimmed = lower.trim_start();
     if trimmed.starts_with("/toolcall ") {
@@ -10858,8 +10940,14 @@ fn looks_like_fabricated_tool_result_output(text: &str) -> bool {
         || lower.contains("[type_text:")
         || lower.contains("[read_screen_text:")
         || lower.contains("[ue5_bridge:")
+        || lower.contains("[ue5_scene_probe:")
         || lower.contains("[blender_bridge:")
+        || lower.contains("[blender_scene_probe:")
         || lower.contains("[unity_bridge:")
+        || lower.contains("[unity_scene_probe:")
+        || lower.contains("[probe_diff:")
+        || lower.contains("[video_capture:")
+        || lower.contains("[video_keyframes:")
         || lower.contains("\"stdout\"")
         || lower.contains("\"stderr\"")
         || lower.contains("\"exit_code\"")
@@ -10937,8 +11025,14 @@ fn looks_like_execution_ready_line(line: &str) -> bool {
         || lower.starts_with("<type_text")
         || lower.starts_with("<read_screen_text")
         || lower.starts_with("<ue5_bridge")
+        || lower.starts_with("<ue5_scene_probe")
         || lower.starts_with("<blender_bridge")
+        || lower.starts_with("<blender_scene_probe")
         || lower.starts_with("<unity_bridge")
+        || lower.starts_with("<unity_scene_probe")
+        || lower.starts_with("<probe_diff")
+        || lower.starts_with("<video_capture")
+        || lower.starts_with("<video_keyframes")
         || lower.contains("tool_call")
         || lower.contains("toolcall")
     {
@@ -10962,8 +11056,14 @@ fn looks_like_execution_ready_line(line: &str) -> bool {
         "type_text ",
         "read_screen_text",
         "ue5_bridge ",
+        "ue5_scene_probe ",
         "blender_bridge ",
+        "blender_scene_probe ",
         "unity_bridge ",
+        "unity_scene_probe ",
+        "probe_diff ",
+        "video_capture ",
+        "video_keyframes ",
     ];
     prefixes.iter().any(|p| lower.starts_with(p))
 }
@@ -12870,12 +12970,12 @@ fn days_to_ymd(days_since_epoch: i64) -> (i32, u32, u32) {
 fn build_work_prompt(task: &str, snapshot: &str, strict_mode: bool) -> String {
     if strict_mode {
         return format!(
-            "Work in the current local project using tools.\\n\\nWorkspace snapshot:\\n{}\\n\\nTask:\\n{}\\n\\nStrict execution profile:\\n1) Inspect relevant files first with /toolcall glob_search, grep_search, and chunked /toolcall read_file <path> <start_line> <max_lines> (max 240 lines each call).\\n2) Actions must be plain /toolcall lines only (no prose when actions are pending).\\n3) For shell commands on Windows, use PowerShell syntax (`;` separators, not `&&`). Do not use plain `tail`; use PowerShell equivalents.\\n4) Do not run git branch-switching/history-rewrite commands (for example `git checkout`, `git switch`, `git reset`) unless the user explicitly asks.\\n5) If the user says not to use a tool/package manager (for example uv), do not use it. Choose alternatives that follow the user's constraint.\\n6) After edits, run concrete validation commands. If validation fails, emit corrective /toolcall lines and retry until pass or blocked.\\n7) If the user explicitly asks for output artifacts (for example reports or docs), create those files directly via write_file/edit_file in this run and report the exact paths.\\n8) Do not ask clarification questions when required paths/filenames are already explicit in the task. Execute first, then summarize results.",
+            "Work in the current local project using tools.\\n\\nWorkspace snapshot:\\n{}\\n\\nTask:\\n{}\\n\\nStrict execution profile:\\n1) Inspect relevant files first with /toolcall glob_search, grep_search, and chunked /toolcall read_file <path> <start_line> <max_lines> (max 240 lines each call).\\n2) Actions must be plain /toolcall lines only (no prose when actions are pending).\\n3) For shell commands on Windows, use PowerShell syntax (`;` separators, not `&&`). Do not use plain `tail`; use PowerShell equivalents.\\n4) Do not run git branch-switching/history-rewrite commands (for example `git checkout`, `git switch`, `git reset`) unless the user explicitly asks.\\n5) If the user says not to use a tool/package manager (for example uv), do not use it. Choose alternatives that follow the user's constraint.\\n6) After edits, run concrete validation commands. If validation fails, emit corrective /toolcall lines and retry until pass or blocked.\\n7) For complex 3D tasks, prefer scene probes (`blender_scene_probe`, `ue5_scene_probe`, `unity_scene_probe`) and `probe_diff` for structural truth; use `video_capture` + `video_keyframes` only as visual evidence.\\n8) If the user explicitly asks for output artifacts (for example reports or docs), create those files directly via write_file/edit_file in this run and report the exact paths.\\n9) Do not ask clarification questions when required paths/filenames are already explicit in the task. Execute first, then summarize results.",
             snapshot, task
         );
     }
     format!(
-        "Work in the current local project using tools.\\n\\nWorkspace snapshot:\\n{}\\n\\nTask:\\n{}\\n\\nExecution rules:\\n1) Inspect relevant files first with /toolcall glob_search, grep_search, and chunked /toolcall read_file <path> <start_line> <max_lines> (max 240 lines each call).\\n2) Make focused edits with /toolcall write_file or edit_file.\\n3) Run checks with /toolcall bash when useful. On Windows use PowerShell syntax (`;` separators, not `&&`).\\n4) If the user explicitly asks for output artifacts (for example reports or docs), create those files directly via write_file/edit_file in this run and report the exact paths.\\n5) Do not ask clarification questions when required paths/filenames are already explicit in the task. Execute first, then summarize results.\\n6) If more actions are needed, output /toolcall lines only. Otherwise provide the final answer.",
+        "Work in the current local project using tools.\\n\\nWorkspace snapshot:\\n{}\\n\\nTask:\\n{}\\n\\nExecution rules:\\n1) Inspect relevant files first with /toolcall glob_search, grep_search, and chunked /toolcall read_file <path> <start_line> <max_lines> (max 240 lines each call).\\n2) Make focused edits with /toolcall write_file or edit_file.\\n3) Run checks with /toolcall bash when useful. On Windows use PowerShell syntax (`;` separators, not `&&`).\\n4) For complex 3D tasks, prefer deterministic scene probes first (`blender_scene_probe`, `ue5_scene_probe`, `unity_scene_probe`), then use `probe_diff` to verify structural changes, and use `video_capture` + `video_keyframes` only as visual evidence when needed.\\n5) If the user explicitly asks for output artifacts (for example reports or docs), create those files directly via write_file/edit_file in this run and report the exact paths.\\n6) Do not ask clarification questions when required paths/filenames are already explicit in the task. Execute first, then summarize results.\\n7) If more actions are needed, output /toolcall lines only. Otherwise provide the final answer.",
         snapshot, task
     )
 }
@@ -15037,7 +15137,7 @@ pub(crate) fn format_context_contract_header(
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "Context Contract:\nmode={} speed={} permission_mode={} tools=[read_file,write_file,edit_file,glob_search,grep_search,web_search,web_fetch,bash,screenshot,find_window,click,click_text,type_text,read_screen_text,ue5_bridge,blender_bridge,unity_bridge]\nconstraints={} budget={{steps:{},duration_secs:{},no_progress:{},constraint_blocks:{}}}\nprevious_loop_stop_reason={}",
+        "Context Contract:\nmode={} speed={} permission_mode={} tools=[read_file,write_file,edit_file,glob_search,grep_search,web_search,web_fetch,bash,screenshot,find_window,click,click_text,type_text,read_screen_text,ue5_bridge,ue5_scene_probe,blender_bridge,blender_scene_probe,unity_bridge,unity_scene_probe,probe_diff,video_capture,video_keyframes]\nconstraints={} budget={{steps:{},duration_secs:{},no_progress:{},constraint_blocks:{}}}\nprevious_loop_stop_reason={}",
         mode,
         speed.as_str(),
         rt.permission_mode,
@@ -15170,13 +15270,10 @@ fn is_tool_failure(result: &runtime::TurnResult) -> bool {
     result.text.starts_with("[tool:") && result.text.contains(":error]")
 }
 
-fn compact_tool_panel_body(name: &str, status: &str, body: &str) -> String {
+fn compact_tool_panel_body(ui: &Ui, name: &str, status: &str, body: &str) -> String {
     if name == "read_file" && status == "ok" {
         let header = body.lines().next().unwrap_or("[read_file]").trim();
-        return format!(
-            "{}\n(read content hidden in UI to reduce token-heavy output; use /toolcall read_file <path> <start_line> <max_lines> for exact ranges)",
-            header
-        );
+        return ui.read_file_hidden_notice(header);
     }
     body.to_string()
 }
@@ -15473,6 +15570,14 @@ fn build_repl_help_text_short() -> String {
             "Detailed guide for screenshot tool.",
         ),
         format_help_command_line(
+            "/help toolcall video_capture",
+            "Detailed guide for frame-folder capture tool.",
+        ),
+        format_help_command_line(
+            "/help toolcall ue5_scene_probe",
+            "Detailed guide for UE5 scene probe tool.",
+        ),
+        format_help_command_line(
             "/help computer",
             "Desktop control command family guide.",
         ),
@@ -15539,10 +15644,31 @@ fn build_repl_help_topics_text() -> String {
         format_help_command_line("/help toolcall read_screen_text", "Detailed OCR tool guide."),
         format_help_command_line("/help toolcall ue5_bridge", "Detailed UE5 bridge tool guide."),
         format_help_command_line(
+            "/help toolcall ue5_scene_probe",
+            "Detailed UE5 scene probe guide.",
+        ),
+        format_help_command_line(
             "/help toolcall blender_bridge",
             "Detailed Blender bridge tool guide.",
         ),
+        format_help_command_line(
+            "/help toolcall blender_scene_probe",
+            "Detailed Blender scene probe guide.",
+        ),
         format_help_command_line("/help toolcall unity_bridge", "Detailed Unity bridge tool guide."),
+        format_help_command_line(
+            "/help toolcall unity_scene_probe",
+            "Detailed Unity scene probe guide.",
+        ),
+        format_help_command_line("/help toolcall probe_diff", "Detailed probe diff guide."),
+        format_help_command_line(
+            "/help toolcall video_capture",
+            "Detailed frame capture guide.",
+        ),
+        format_help_command_line(
+            "/help toolcall video_keyframes",
+            "Detailed keyframe selection guide.",
+        ),
         "".to_string(),
         "Examples".to_string(),
         "/help /mcp oauth".to_string(),
@@ -15573,8 +15699,14 @@ fn repl_help_search_index() -> &'static [(&'static str, &'static str)] {
         ("toolcall type_text", "Type text into focused control"),
         ("toolcall read_screen_text", "OCR text from current screen"),
         ("toolcall ue5_bridge", "Run UE5 Python bridge payload"),
+        ("toolcall ue5_scene_probe", "Collect structured UE5 level scene JSON"),
         ("toolcall blender_bridge", "Run Blender Python bridge payload"),
+        ("toolcall blender_scene_probe", "Collect structured Blender scene JSON"),
         ("toolcall unity_bridge", "Run Unity Python bridge payload"),
+        ("toolcall unity_scene_probe", "Collect structured Unity scene JSON"),
+        ("toolcall probe_diff", "Diff before/after scene probe JSON payloads"),
+        ("toolcall video_capture", "Capture frame folder for temporal context"),
+        ("toolcall video_keyframes", "Select compact keyframes from captured frames"),
         ("computer", "Desktop control subcommands"),
         ("permissions", "Permission modes and allow/deny rules"),
         ("agent", "Subagent lifecycle and task views"),
@@ -16031,10 +16163,22 @@ Tools:
   Example: /toolcall read_screen_text
 - ue5_bridge: Run Python script through UE5 bridge.
   Example: /toolcall ue5_bridge {\"script\":\"print('hello')\",\"project\":\"D:/UE/MyProj/MyProj.uproject\"}
+- ue5_scene_probe: Collect structured UE5 level scene JSON for 3D reasoning loops.
+  Example: /toolcall ue5_scene_probe {\"project\":\"D:/UE/MyProj/MyProj.uproject\",\"max_objects\":500}
 - blender_bridge: Run Python script through Blender bridge.
   Example: /toolcall blender_bridge {\"script\":\"print('hello')\"}
+- blender_scene_probe: Collect structured Blender scene JSON for 3D reasoning loops.
+  Example: /toolcall blender_scene_probe {}
 - unity_bridge: Run Python script through Unity bridge.
-  Example: /toolcall unity_bridge {\"script\":\"print('hello')\",\"project\":\"D:/Unity/MyProj\"}"
+  Example: /toolcall unity_bridge {\"script\":\"print('hello')\",\"project\":\"D:/Unity/MyProj\"}
+- unity_scene_probe: Collect structured Unity active-scene JSON for 3D reasoning loops.
+  Example: /toolcall unity_scene_probe {\"project\":\"D:/Unity/MyProj\",\"max_objects\":1000}
+- probe_diff: Compare before/after probe JSON and return added/removed/modified objects.
+  Example: /toolcall probe_diff {\"before\": {...}, \"after\": {...}}
+- video_capture: Capture frame-folder sequence (no mp4 state) for temporal context.
+  Example: /toolcall video_capture {\"duration_sec\":8,\"fps\":2,\"target\":\"window\",\"window_title\":\"Unreal Editor\"}
+- video_keyframes: Select compact keyframes from captured PNG frames.
+  Example: /toolcall video_keyframes {\"dir\":\"C:/Users/me/AppData/Local/Temp/asi_capture_x\",\"max_frames\":12}"
         }
         "permissions" => {
             "Help Topic: /permissions
@@ -16451,6 +16595,22 @@ Notes:
 - Uses UnrealEditor command-line Python execution.
 - Set editor path via ASI_UE5_EDITOR or UE5_EDITOR if needed.",
         ),
+        "toolcall ue5_scene_probe" => Some(
+            "Help Topic: /toolcall ue5_scene_probe
+
+Purpose:
+Capture deterministic UE5 level scene state as structured JSON for 3D reasoning loops.
+
+Usage:
+/toolcall ue5_scene_probe <json>
+
+Example:
+/toolcall ue5_scene_probe {\"project\":\"D:/UE/MyProj/MyProj.uproject\",\"max_objects\":500}
+
+Notes:
+- Requires `project` path to run UnrealEditor-Cmd.
+- Internally runs through ue5_bridge and emits probe payload to stdout.",
+        ),
         "toolcall blender_bridge" => Some(
             "Help Topic: /toolcall blender_bridge
 
@@ -16467,6 +16627,22 @@ Notes:
 - Uses `blender --background --python`.
 - Set binary via ASI_BLENDER_BIN or BLENDER_BIN if needed.",
         ),
+        "toolcall blender_scene_probe" => Some(
+            "Help Topic: /toolcall blender_scene_probe
+
+Purpose:
+Capture deterministic Blender scene state as structured JSON for 3D reasoning loops.
+
+Usage:
+/toolcall blender_scene_probe <json>
+
+Example:
+/toolcall blender_scene_probe {}
+
+Notes:
+- Returns objects/transforms/cameras/lights/actions in JSON.
+- Internally runs through blender_bridge and emits probe payload to stdout.",
+        ),
         "toolcall unity_bridge" => Some(
             "Help Topic: /toolcall unity_bridge
 
@@ -16482,6 +16658,70 @@ Example:
 Notes:
 - Requires a Unity-side entrypoint method: `PythonRunner.RunFile`.
 - Set editor path via ASI_UNITY_EDITOR or UNITY_EDITOR if needed.",
+        ),
+        "toolcall unity_scene_probe" => Some(
+            "Help Topic: /toolcall unity_scene_probe
+
+Purpose:
+Capture deterministic Unity active-scene state as structured JSON for 3D reasoning loops.
+
+Usage:
+/toolcall unity_scene_probe <json>
+
+Example:
+/toolcall unity_scene_probe {\"project\":\"D:/Unity/MyProj\",\"max_objects\":1000,\"include_inactive\":true}
+
+Notes:
+- Requires Unity Editor to be running for the target project.
+- Internally runs through unity_bridge action=csharp and emits probe payload to stdout.",
+        ),
+        "toolcall probe_diff" => Some(
+            "Help Topic: /toolcall probe_diff
+
+Purpose:
+Compute deterministic structural delta between two probe payloads.
+
+Usage:
+/toolcall probe_diff <json>
+
+Example:
+/toolcall probe_diff {\"before\": {...}, \"after\": {...}, \"numeric_tolerance\": 0.0001}
+
+Notes:
+- Focuses on object-level added/removed/modified records.
+- Use numeric_tolerance to suppress tiny float jitter.",
+        ),
+        "toolcall video_capture" => Some(
+            "Help Topic: /toolcall video_capture
+
+Purpose:
+Capture a frame-folder sequence for temporal context (v1, no mp4 process state).
+
+Usage:
+/toolcall video_capture <json>
+
+Example:
+/toolcall video_capture {\"duration_sec\":8,\"fps\":2,\"target\":\"window\",\"window_title\":\"Unreal Editor\"}
+
+Notes:
+- target can be window or fullscreen.
+- For window target, prefer window_pid when available.",
+        ),
+        "toolcall video_keyframes" => Some(
+            "Help Topic: /toolcall video_keyframes
+
+Purpose:
+Select compact keyframes from a captured PNG frame directory.
+
+Usage:
+/toolcall video_keyframes <json>
+
+Example:
+/toolcall video_keyframes {\"dir\":\"C:/Temp/asi_capture_x\",\"max_frames\":12}
+
+Notes:
+- Uses brightness-delta heuristics plus boundary frames.
+- Designed to keep multimodal context small for model calls.",
         ),
         "toolcall bash" => Some(
             "Help Topic: /toolcall bash
@@ -16855,19 +17095,43 @@ fn build_repl_help_text() -> String {
             "Run UE5 Python bridge script payload.",
         ),
         format_help_command_line(
+            "/toolcall ue5_scene_probe <json>",
+            "Collect structured UE5 scene probe JSON.",
+        ),
+        format_help_command_line(
             "/toolcall blender_bridge <json>",
             "Run Blender Python bridge script payload.",
+        ),
+        format_help_command_line(
+            "/toolcall blender_scene_probe <json>",
+            "Collect structured Blender scene probe JSON.",
         ),
         format_help_command_line(
             "/toolcall unity_bridge <json>",
             "Run Unity Python bridge script payload.",
         ),
         format_help_command_line(
+            "/toolcall unity_scene_probe <json>",
+            "Collect structured Unity scene probe JSON.",
+        ),
+        format_help_command_line(
+            "/toolcall probe_diff <json>",
+            "Diff before/after scene probe payloads.",
+        ),
+        format_help_command_line(
+            "/toolcall video_capture <json>",
+            "Capture frame-folder sequence for temporal context.",
+        ),
+        format_help_command_line(
+            "/toolcall video_keyframes <json>",
+            "Select compact keyframes from captured frames.",
+        ),
+        format_help_command_line(
             "/computer <subcommand>",
             "Convenience desktop control command family.",
         ),
         format_help_command_line(
-            "/help toolcall <read_file|write_file|edit_file|glob_search|grep_search|web_search|web_fetch|bash|screenshot|find_window|click|click_text|type_text|read_screen_text|ue5_bridge|blender_bridge|unity_bridge>",
+            "/help toolcall <read_file|write_file|edit_file|glob_search|grep_search|web_search|web_fetch|bash|screenshot|find_window|click|click_text|type_text|read_screen_text|ue5_bridge|ue5_scene_probe|blender_bridge|blender_scene_probe|unity_bridge|unity_scene_probe|probe_diff|video_capture|video_keyframes>",
             "Show detailed guide for one tool.",
         ),
         "".to_string(),

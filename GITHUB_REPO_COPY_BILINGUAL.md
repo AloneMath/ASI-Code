@@ -80,7 +80,23 @@ Body:
 4）卡住的问题，
 5）你最希望优先实现的功能。`
 
-## 8) First Public Beta Release Post Template
+## 8) 2.0 Preview Highlights (EN + ZH)
+
+EN:
+`ASI Code 2.0 is coming soon. Highlights already merged on main:
+- Tier 1 — native computer-control tools: screenshot, find_window, click / click_text, type_text (now with explicit window targeting and clipboard-paste delivery), read_screen_text OCR.
+- Tier 2 — live engine bridges: ue5_bridge, blender_bridge, unity_bridge (with action=open|csharp|create_terrain|save for live-editor C# drops).
+- Tier 3 — 3D-aware probes and temporal capture: blender_scene_probe, ue5_scene_probe, unity_scene_probe, probe_diff for deterministic structural verification, plus video_capture + video_keyframes (frame-folder design, no MP4 dependency) for temporal context.
+- Smarter auto-loop: read-only investigation tool calls now count as progress, no longer trip the no-progress circuit breaker mid-investigation.`
+
+ZH:
+`ASI Code 2.0 即将发布。已合入 main 的核心亮点：
+- Tier 1 — 原生电脑控制工具：screenshot、find_window、click / click_text、type_text（已支持显式窗口定位与剪贴板粘贴），以及 read_screen_text OCR。
+- Tier 2 — 专业软件实时桥接：ue5_bridge、blender_bridge、unity_bridge（action=open|csharp|create_terrain|save，可向已打开的编辑器投放 C# 脚本）。
+- Tier 3 — 3D 感知探针与时序采集：blender_scene_probe、ue5_scene_probe、unity_scene_probe、用于确定性结构校验的 probe_diff，以及帧目录式的 video_capture + video_keyframes（无需 MP4 依赖）提供时序上下文。
+- 更聪明的自动循环：只读类调查工具调用也计入进度，不再在调查过程中误触发"无进度"熔断。`
+
+## 9) First Public Beta Release Post Template
 
 Title:
 `v0.3.0-beta.1: Open-Core CLI Agent Public Beta`

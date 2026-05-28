@@ -350,6 +350,21 @@ pub fn tool_definitions_openai() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "ue5_scene_probe",
+                "description": "Collect structured UE5 level scene state as JSON for deterministic 3D reasoning.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string", "description": "UE project path (.uproject) for UnrealEditor-Cmd"},
+                        "max_objects": {"type": "integer", "description": "Maximum actors to include in output (default 500)"}
+                    },
+                    "required": ["project"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "blender_bridge",
                 "description": "Run Python script through Blender bridge (`blender --background --python`).",
                 "parameters": {
@@ -359,6 +374,21 @@ pub fn tool_definitions_openai() -> Value {
                         "project": {"type": "string", "description": "Optional blend file path (reserved)"}
                     },
                     "required": ["script"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "blender_scene_probe",
+                "description": "Collect structured Blender scene state as JSON (objects, transforms, cameras, lights, actions) for deterministic 3D reasoning.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string", "description": "Optional .blend path (reserved for future direct-open support)"},
+                        "script": {"type": "string", "description": "Optional Python snippet appended after probe collection"}
+                    },
+                    "required": []
                 }
             }
         },
@@ -379,6 +409,72 @@ pub fn tool_definitions_openai() -> Value {
                         "name": {"type": "string", "description": "GameObject name for create_terrain. Defaults to AsiTerrain."}
                     },
                     "required": ["project"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "unity_scene_probe",
+                "description": "Collect structured Unity active-scene state as JSON by running C# in the live Editor.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string", "description": "Absolute path to Unity project root"},
+                        "max_objects": {"type": "integer", "description": "Maximum objects to include (default 1000)"},
+                        "include_inactive": {"type": "boolean", "description": "Include inactive objects (default true)"}
+                    },
+                    "required": ["project"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "probe_diff",
+                "description": "Compute deterministic JSON diff between two scene probes (`before` and `after`).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "before": {"type": "object", "description": "Probe JSON before mutation"},
+                        "after": {"type": "object", "description": "Probe JSON after mutation"},
+                        "numeric_tolerance": {"type": "number", "description": "Optional absolute epsilon for numeric comparisons (default 0.0001)"}
+                    },
+                    "required": ["before", "after"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video_capture",
+                "description": "Capture frame sequence to a directory (v1 frame-folder approach, no mp4 state).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "duration_sec": {"type": "integer", "description": "Capture duration in seconds (default 6)"},
+                        "fps": {"type": "integer", "description": "Sampling FPS (default 2)"},
+                        "target": {"type": "string", "description": "Capture target: window or fullscreen", "enum": ["window", "fullscreen"]},
+                        "window_title": {"type": "string", "description": "Window-title substring when target=window"},
+                        "window_pid": {"type": "integer", "description": "Preferred target window PID when target=window"},
+                        "out_dir": {"type": "string", "description": "Optional output directory; auto-generated temp dir when omitted"}
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video_keyframes",
+                "description": "Select a compact keyframe set from captured PNG frames in a directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dir": {"type": "string", "description": "Frame directory from video_capture"},
+                        "max_frames": {"type": "integer", "description": "Maximum selected frames to return (default 12)"}
+                    },
+                    "required": ["dir"]
                 }
             }
         }
@@ -560,6 +656,18 @@ pub fn tool_definitions_claude() -> Value {
             }
         },
         {
+            "name": "ue5_scene_probe",
+            "description": "Collect structured UE5 level scene state as JSON for deterministic 3D reasoning.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "UE project path (.uproject) for UnrealEditor-Cmd"},
+                    "max_objects": {"type": "integer", "description": "Maximum actors to include in output (default 500)"}
+                },
+                "required": ["project"]
+            }
+        },
+        {
             "name": "blender_bridge",
             "description": "Run Python script through Blender bridge (`blender --background --python`).",
             "input_schema": {
@@ -569,6 +677,18 @@ pub fn tool_definitions_claude() -> Value {
                     "project": {"type": "string", "description": "Optional blend file path (reserved)"}
                 },
                 "required": ["script"]
+            }
+        },
+        {
+            "name": "blender_scene_probe",
+            "description": "Collect structured Blender scene state as JSON (objects, transforms, cameras, lights, actions) for deterministic 3D reasoning.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Optional .blend path (reserved for future direct-open support)"},
+                    "script": {"type": "string", "description": "Optional Python snippet appended after probe collection"}
+                },
+                "required": []
             }
         },
         {
@@ -586,6 +706,60 @@ pub fn tool_definitions_claude() -> Value {
                     "name": {"type": "string", "description": "GameObject name for create_terrain. Defaults to AsiTerrain."}
                 },
                 "required": ["project"]
+            }
+        },
+        {
+            "name": "unity_scene_probe",
+            "description": "Collect structured Unity active-scene state as JSON by running C# in the live Editor.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Absolute path to Unity project root"},
+                    "max_objects": {"type": "integer", "description": "Maximum objects to include (default 1000)"},
+                    "include_inactive": {"type": "boolean", "description": "Include inactive objects (default true)"}
+                },
+                "required": ["project"]
+            }
+        },
+        {
+            "name": "probe_diff",
+            "description": "Compute deterministic JSON diff between two scene probes (`before` and `after`).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "before": {"type": "object", "description": "Probe JSON before mutation"},
+                    "after": {"type": "object", "description": "Probe JSON after mutation"},
+                    "numeric_tolerance": {"type": "number", "description": "Optional absolute epsilon for numeric comparisons (default 0.0001)"}
+                },
+                "required": ["before", "after"]
+            }
+        },
+        {
+            "name": "video_capture",
+            "description": "Capture frame sequence to a directory (v1 frame-folder approach, no mp4 state).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "duration_sec": {"type": "integer", "description": "Capture duration in seconds (default 6)"},
+                    "fps": {"type": "integer", "description": "Sampling FPS (default 2)"},
+                    "target": {"type": "string", "description": "Capture target: window or fullscreen", "enum": ["window", "fullscreen"]},
+                    "window_title": {"type": "string", "description": "Window-title substring when target=window"},
+                    "window_pid": {"type": "integer", "description": "Preferred target window PID when target=window"},
+                    "out_dir": {"type": "string", "description": "Optional output directory; auto-generated temp dir when omitted"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "video_keyframes",
+            "description": "Select a compact keyframe set from captured PNG frames in a directory.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "dir": {"type": "string", "description": "Frame directory from video_capture"},
+                    "max_frames": {"type": "integer", "description": "Maximum selected frames to return (default 12)"}
+                },
+                "required": ["dir"]
             }
         }
     ])
@@ -683,7 +857,15 @@ pub fn tool_call_to_legacy_args(name: &str, arguments: &str) -> String {
             .unwrap_or("")
             .to_string(),
         "read_screen_text" => String::new(),
-        "ue5_bridge" | "blender_bridge" | "unity_bridge" => args.to_string(),
+        "ue5_bridge"
+        | "ue5_scene_probe"
+        | "blender_bridge"
+        | "blender_scene_probe"
+        | "unity_bridge"
+        | "unity_scene_probe"
+        | "probe_diff"
+        | "video_capture"
+        | "video_keyframes" => args.to_string(),
         _ => arguments.to_string(),
     }
 }
@@ -1515,6 +1697,16 @@ impl ChatProvider for ProviderClient {
 #[cfg(test)]
 mod tests {
     use super::tool_call_to_legacy_args;
+    use serde_json::Value;
+
+    fn assert_json_passthrough(tool: &str, args: &str) {
+        let actual = tool_call_to_legacy_args(tool, args);
+        let actual_json: Value =
+            serde_json::from_str(&actual).expect("legacy args output should be valid JSON");
+        let expected_json: Value =
+            serde_json::from_str(args).expect("test input should be valid JSON");
+        assert_eq!(actual_json, expected_json);
+    }
 
     #[test]
     fn tool_call_to_legacy_args_maps_computer_tools() {
@@ -1566,5 +1758,15 @@ mod tests {
             tool_call_to_legacy_args("type_text", r#"{"input":"xyz"}"#),
             "xyz"
         );
+    }
+
+    #[test]
+    fn tool_call_to_legacy_args_passes_through_probe_and_video_json_tools() {
+        assert_json_passthrough("blender_scene_probe", r#"{"project":"D:/blend/a.blend"}"#);
+        assert_json_passthrough("ue5_scene_probe", r#"{"project":"D:/UE/P/P.uproject","max_objects":321}"#);
+        assert_json_passthrough("unity_scene_probe", r#"{"project":"D:/Unity/P","max_objects":256,"include_inactive":false}"#);
+        assert_json_passthrough("probe_diff", r#"{"before":{"objects":[]},"after":{"objects":[]}}"#);
+        assert_json_passthrough("video_capture", r#"{"duration_sec":8,"fps":2}"#);
+        assert_json_passthrough("video_keyframes", r#"{"dir":"C:/tmp/cap","max_frames":12}"#);
     }
 }

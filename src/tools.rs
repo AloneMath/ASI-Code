@@ -12,6 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BRIDGE_TIMEOUT_SECS_DEFAULT: u64 = 120;
 const BRIDGE_TIMEOUT_SECS_MAX: u64 = 3600;
+const VIDEO_CAPTURE_DEFAULT_DURATION_SECS: u64 = 6;
+const VIDEO_CAPTURE_DEFAULT_FPS: u64 = 2;
+const VIDEO_CAPTURE_MAX_DURATION_SECS: u64 = 120;
+const VIDEO_CAPTURE_MAX_FPS: u64 = 10;
+const VIDEO_KEYFRAMES_DEFAULT_MAX: usize = 12;
+const VIDEO_KEYFRAMES_MAX: usize = 64;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct BridgeRequest {
@@ -40,6 +46,40 @@ struct BridgeRequest {
     /// Optional name for created GameObjects (default "AsiTerrain").
     #[serde(default)]
     name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VideoCaptureRequest {
+    #[serde(default)]
+    duration_sec: Option<u64>,
+    #[serde(default)]
+    fps: Option<u64>,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    window_title: String,
+    #[serde(default)]
+    window_pid: Option<u64>,
+    #[serde(default)]
+    out_dir: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VideoKeyframesRequest {
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    max_frames: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct UnitySceneProbeRequest {
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    max_objects: Option<usize>,
+    #[serde(default)]
+    include_inactive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -292,8 +332,14 @@ pub fn run_tool(name: &str, args: &str) -> ToolResult {
         }
         "read_screen_text" => read_screen_text(),
         "ue5_bridge" => ue5_bridge(args),
+        "ue5_scene_probe" => ue5_scene_probe(args),
         "blender_bridge" => blender_bridge(args),
+        "blender_scene_probe" => blender_scene_probe(args),
         "unity_bridge" => unity_bridge(args),
+        "unity_scene_probe" => unity_scene_probe(args),
+        "probe_diff" => probe_diff(args),
+        "video_capture" => video_capture(args),
+        "video_keyframes" => video_keyframes(args),
         _ => ToolResult::err(format!("Unknown tool: {}", name)),
     }
 }
@@ -2468,6 +2514,58 @@ fn parse_bridge_request(args: &str) -> Result<BridgeRequest, String> {
     })
 }
 
+fn parse_video_capture_request(args: &str) -> Result<VideoCaptureRequest, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok(VideoCaptureRequest::default());
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| format!("invalid video_capture JSON args: {}", e))
+    } else {
+        let dir = strip_surrounding_quotes(trimmed).to_string();
+        Ok(VideoCaptureRequest {
+            out_dir: dir,
+            ..VideoCaptureRequest::default()
+        })
+    }
+}
+
+fn parse_video_keyframes_request(args: &str) -> Result<VideoKeyframesRequest, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err("video_keyframes requires args with `dir`".to_string());
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| format!("invalid video_keyframes JSON args: {}", e))
+    } else {
+        let mut out = VideoKeyframesRequest::default();
+        let mut parts = trimmed.split_whitespace();
+        out.dir = strip_surrounding_quotes(parts.next().unwrap_or("")).to_string();
+        if let Some(raw) = parts.next() {
+            out.max_frames = raw.parse::<usize>().ok();
+        }
+        Ok(out)
+    }
+}
+
+fn parse_unity_scene_probe_request(args: &str) -> Result<UnitySceneProbeRequest, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err("unity_scene_probe requires args with `project`".to_string());
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| format!("invalid unity_scene_probe JSON args: {}", e))
+    } else {
+        Ok(UnitySceneProbeRequest {
+            project: strip_surrounding_quotes(trimmed).to_string(),
+            ..UnitySceneProbeRequest::default()
+        })
+    }
+}
+
 /// Validate that a request carries a non-empty script for engines that
 /// can only operate in batch mode (UE5, Blender). Each engine wraps this
 /// check at its dispatch site because the validation was previously
@@ -2487,6 +2585,52 @@ fn bridge_timeout_secs() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| v.clamp(1, BRIDGE_TIMEOUT_SECS_MAX))
         .unwrap_or(BRIDGE_TIMEOUT_SECS_DEFAULT)
+}
+
+fn now_nonce() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{}_{}", std::process::id(), ts)
+}
+
+fn unique_capture_dir() -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("asi_capture_{}", now_nonce()));
+    p
+}
+
+fn serde_from_file_or_inline_json(args: &str, key: &str) -> Result<serde_json::Value, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{} requires JSON args", key));
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON args: {}", e));
+    }
+    let inline = strip_surrounding_quotes(trimmed);
+    let path = Path::new(inline);
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read JSON file '{}': {}", path.display(), e))?;
+    serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "invalid JSON in file '{}': {}",
+            path.display(),
+            e
+        )
+    })
+}
+
+fn json_value_number_or_string_to_f64(v: &serde_json::Value) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    v.as_str()?.parse::<f64>().ok()
+}
+
+fn json_pointer_escape(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 fn unique_bridge_file(engine: &str, ext: &str) -> PathBuf {
@@ -2663,6 +2807,119 @@ pub fn ue5_bridge(args: &str) -> ToolResult {
     res
 }
 
+pub fn ue5_scene_probe(args: &str) -> ToolResult {
+    let parsed = match serde_from_file_or_inline_json(args, "ue5_scene_probe") {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let project = parsed
+        .get("project")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let max_objects = parsed
+        .get("max_objects")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(500)
+        .clamp(1, 5000);
+
+    let mut script = String::new();
+    script.push_str(
+        r#"
+import json
+import unreal
+
+max_objects = "#,
+    );
+    script.push_str(&max_objects.to_string());
+    script.push_str(
+        r#"
+
+actors = unreal.EditorLevelLibrary.get_all_level_actors()
+objects = []
+for actor in actors[:max_objects]:
+    cls = ""
+    try:
+        cls = actor.get_class().get_name()
+    except Exception:
+        cls = ""
+
+    location = actor.get_actor_location()
+    rotation = actor.get_actor_rotation()
+    scale = actor.get_actor_scale3d()
+    origin, box_extent = actor.get_actor_bounds(False)
+
+    static_mesh = None
+    materials = []
+    has_static_mesh = False
+    try:
+        smcs = actor.get_components_by_class(unreal.StaticMeshComponent)
+    except Exception:
+        smcs = []
+    if smcs:
+        comp = smcs[0]
+        has_static_mesh = True
+        try:
+            mesh_obj = comp.static_mesh
+            if mesh_obj:
+                static_mesh = mesh_obj.get_name()
+        except Exception:
+            static_mesh = None
+        try:
+            count = int(comp.get_num_materials())
+            for idx in range(count):
+                mat = comp.get_material(idx)
+                materials.append(mat.get_name() if mat else None)
+        except Exception:
+            materials = []
+
+    objects.append({
+        "name": actor.get_actor_label(),
+        "class": cls,
+        "location": [round(float(location.x), 6), round(float(location.y), 6), round(float(location.z), 6)],
+        "rotation": [round(float(rotation.roll), 6), round(float(rotation.pitch), 6), round(float(rotation.yaw), 6)],
+        "scale": [round(float(scale.x), 6), round(float(scale.y), 6), round(float(scale.z), 6)],
+        "bounds_origin": [round(float(origin.x), 6), round(float(origin.y), 6), round(float(origin.z), 6)],
+        "bounds_extent": [round(float(box_extent.x), 6), round(float(box_extent.y), 6), round(float(box_extent.z), 6)],
+        "folder": str(actor.get_folder_path()),
+        "has_static_mesh": bool(has_static_mesh),
+        "static_mesh": static_mesh,
+        "materials": materials,
+    })
+
+world = unreal.EditorLevelLibrary.get_editor_world()
+level_name = None
+if world is not None:
+    try:
+        level_name = world.get_name()
+    except Exception:
+        level_name = None
+
+result = {
+    "probe_version": 1,
+    "engine": "ue5",
+    "level": level_name,
+    "counts": {
+        "objects": len(objects),
+        "actors_total": len(actors),
+        "actors_sampled": len(objects),
+        "truncated": len(actors) > len(objects),
+    },
+    "objects": objects,
+}
+print(json.dumps(result, ensure_ascii=False))
+"#,
+    );
+
+    let req = serde_json::json!({
+        "script": script,
+        "project": project,
+    });
+    ue5_bridge(&req.to_string())
+}
+
 pub fn blender_bridge(args: &str) -> ToolResult {
     let req = match parse_bridge_request(args) {
         Ok(v) => v,
@@ -2692,6 +2949,681 @@ pub fn blender_bridge(args: &str) -> ToolResult {
     let res = run_bridge_command("blender_bridge", cmd, bridge_timeout_secs());
     let _ = fs::remove_file(&script_file);
     res
+}
+
+pub fn blender_scene_probe(args: &str) -> ToolResult {
+    let req = match parse_bridge_request(args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let mut script = String::new();
+    script.push_str(
+        r#"
+import bpy
+import json
+import math
+import os
+
+def _vec3(v):
+    return [round(float(v[0]), 6), round(float(v[1]), 6), round(float(v[2]), 6)]
+
+def _quat(q):
+    return [round(float(q.w), 6), round(float(q.x), 6), round(float(q.y), 6), round(float(q.z), 6)]
+
+def _bounds_world(obj):
+    try:
+        pts = [obj.matrix_world @ bpy.types.Vector(corner) for corner in obj.bound_box]
+    except Exception:
+        try:
+            pts = [obj.matrix_world @ bpy.mathutils.Vector(corner) for corner in obj.bound_box]
+        except Exception:
+            return None
+    xs = [p.x for p in pts]
+    ys = [p.y for p in pts]
+    zs = [p.z for p in pts]
+    return {
+        "min": [round(float(min(xs)), 6), round(float(min(ys)), 6), round(float(min(zs)), 6)],
+        "max": [round(float(max(xs)), 6), round(float(max(ys)), 6), round(float(max(zs)), 6)],
+    }
+
+scene = bpy.context.scene
+objects = []
+for obj in scene.objects:
+    mats = []
+    if hasattr(obj.data, "materials") and obj.data and obj.data.materials:
+        mats = [m.name for m in obj.data.materials if m]
+    action_name = None
+    if obj.animation_data and obj.animation_data.action:
+        action_name = obj.animation_data.action.name
+    objects.append({
+        "name": obj.name,
+        "type": obj.type,
+        "parent": obj.parent.name if obj.parent else None,
+        "visible": bool(obj.visible_get()),
+        "location": _vec3(obj.location),
+        "rotation_mode": obj.rotation_mode,
+        "rotation_euler": _vec3(obj.rotation_euler) if obj.rotation_mode != "QUATERNION" else None,
+        "rotation_quaternion": _quat(obj.rotation_quaternion) if obj.rotation_mode == "QUATERNION" else None,
+        "scale": _vec3(obj.scale),
+        "dimensions": _vec3(obj.dimensions),
+        "bounds_world": _bounds_world(obj),
+        "vertex_count": int(len(obj.data.vertices)) if obj.type == "MESH" and obj.data else None,
+        "face_count": int(len(obj.data.polygons)) if obj.type == "MESH" and obj.data else None,
+        "material_slots": mats,
+        "action": action_name,
+    })
+
+cameras = []
+for obj in scene.objects:
+    if obj.type == "CAMERA" and obj.data:
+        cam = obj.data
+        cameras.append({
+            "name": obj.name,
+            "lens_mm": round(float(cam.lens), 6),
+            "clip_start": round(float(cam.clip_start), 6),
+            "clip_end": round(float(cam.clip_end), 6),
+            "sensor_width": round(float(cam.sensor_width), 6),
+            "sensor_height": round(float(cam.sensor_height), 6),
+            "location": _vec3(obj.location),
+            "rotation_euler": _vec3(obj.rotation_euler),
+        })
+
+lights = []
+for obj in scene.objects:
+    if obj.type == "LIGHT" and obj.data:
+        light = obj.data
+        lights.append({
+            "name": obj.name,
+            "light_type": light.type,
+            "energy": round(float(light.energy), 6),
+            "color": [round(float(light.color[0]), 6), round(float(light.color[1]), 6), round(float(light.color[2]), 6)],
+            "location": _vec3(obj.location),
+        })
+
+animations = []
+for action in bpy.data.actions:
+    start, end = action.frame_range
+    animations.append({
+        "name": action.name,
+        "frame_start": round(float(start), 3),
+        "frame_end": round(float(end), 3),
+        "fcurve_count": int(len(action.fcurves)),
+    })
+
+world_name = scene.world.name if scene.world else None
+result = {
+    "probe_version": 1,
+    "engine": "blender",
+    "scene": scene.name,
+    "blend_file": bpy.data.filepath,
+    "frame_current": int(scene.frame_current),
+    "frame_start": int(scene.frame_start),
+    "frame_end": int(scene.frame_end),
+    "fps": float(scene.render.fps) / float(scene.render.fps_base),
+    "unit_system": scene.unit_settings.system,
+    "unit_scale": float(scene.unit_settings.scale_length),
+    "world": world_name,
+    "counts": {
+        "objects": len(objects),
+        "meshes": len([o for o in objects if o["type"] == "MESH"]),
+        "cameras": len(cameras),
+        "lights": len(lights),
+        "actions": len(animations),
+    },
+    "active_camera": scene.camera.name if scene.camera else None,
+    "objects": objects,
+    "cameras": cameras,
+    "lights": lights,
+    "animations": animations,
+}
+print(json.dumps(result, ensure_ascii=False))
+"#,
+    );
+    if !req.script.trim().is_empty() {
+        script.push_str("\n# user_append\n");
+        script.push_str(req.script.trim());
+        script.push('\n');
+    }
+    let args_json = serde_json::json!({
+        "script": script,
+        "project": req.project,
+    })
+    .to_string();
+    blender_bridge(&args_json)
+}
+
+pub fn unity_scene_probe(args: &str) -> ToolResult {
+    let req = match parse_unity_scene_probe_request(args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let project = req.project.trim();
+    if project.is_empty() {
+        return ToolResult::err("unity_scene_probe requires non-empty `project`");
+    }
+    let max_objects = req.max_objects.unwrap_or(1000).clamp(1, 10000);
+    let include_inactive = req.include_inactive.unwrap_or(true);
+    let include_inactive_literal = if include_inactive { "true" } else { "false" };
+    let csharp = format!(
+        r#"
+var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+
+string F(double value) {{
+    return value.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
+}}
+string B(bool value) {{
+    return value ? "true" : "false";
+}}
+string E(string value) {{
+    if (value == null) {{
+        return "";
+    }}
+    return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+}}
+
+var sb = new System.Text.StringBuilder();
+sb.Append("{{");
+sb.Append("\"probe_version\":1,");
+sb.Append("\"engine\":\"unity\",");
+sb.Append("\"scene\":\"").Append(E(scene.name)).Append("\",");
+sb.Append("\"scene_path\":\"").Append(E(scene.path)).Append("\",");
+
+var roots = scene.GetRootGameObjects();
+var queue = new System.Collections.Generic.Queue<UnityEngine.Transform>();
+foreach (var root in roots) {{
+    if (root != null) {{
+        queue.Enqueue(root.transform);
+    }}
+}}
+
+var objectCount = 0;
+var firstObject = true;
+sb.Append("\"objects\":[");
+
+while (queue.Count > 0 && objectCount < {max_objects}) {{
+    var t = queue.Dequeue();
+    if (t == null) {{
+        continue;
+    }}
+    var go = t.gameObject;
+
+    for (int i = 0; i < t.childCount; i++) {{
+        queue.Enqueue(t.GetChild(i));
+    }}
+
+    if (!{include_inactive_literal} && !go.activeInHierarchy) {{
+        continue;
+    }}
+
+    var pos = t.position;
+    var rot = t.rotation.eulerAngles;
+    var scl = t.lossyScale;
+    var comps = go.GetComponents<UnityEngine.Component>();
+
+    if (!firstObject) {{
+        sb.Append(",");
+    }}
+    firstObject = false;
+
+    sb.Append("{{");
+    sb.Append("\"name\":\"").Append(E(go.name)).Append("\",");
+    sb.Append("\"active_self\":").Append(B(go.activeSelf)).Append(",");
+    sb.Append("\"active_in_hierarchy\":").Append(B(go.activeInHierarchy)).Append(",");
+    sb.Append("\"layer\":").Append(go.layer).Append(",");
+    sb.Append("\"tag\":\"").Append(E(go.tag)).Append("\",");
+    sb.Append("\"child_count\":").Append(t.childCount).Append(",");
+    sb.Append("\"position\":[").Append(F(pos.x)).Append(",").Append(F(pos.y)).Append(",").Append(F(pos.z)).Append("],");
+    sb.Append("\"rotation\":[").Append(F(rot.x)).Append(",").Append(F(rot.y)).Append(",").Append(F(rot.z)).Append("],");
+    sb.Append("\"scale\":[").Append(F(scl.x)).Append(",").Append(F(scl.y)).Append(",").Append(F(scl.z)).Append("],");
+    sb.Append("\"components\":[");
+    for (int ci = 0; ci < comps.Length; ci++) {{
+        if (ci > 0) {{
+            sb.Append(",");
+        }}
+        var c = comps[ci];
+        var cname = c == null ? "Missing" : c.GetType().Name;
+        sb.Append("\"").Append(E(cname)).Append("\"");
+    }}
+    sb.Append("]");
+    sb.Append("}}");
+
+    objectCount += 1;
+}}
+
+sb.Append("],");
+sb.Append("\"counts\":{{");
+sb.Append("\"roots\":").Append(roots.Length).Append(",");
+sb.Append("\"objects\":").Append(objectCount).Append(",");
+sb.Append("\"truncated\":").Append(B(queue.Count > 0));
+sb.Append("}}");
+sb.Append("}}");
+
+UnityEngine.Debug.Log(sb.ToString());
+"#,
+        max_objects = max_objects,
+        include_inactive_literal = include_inactive_literal
+    );
+
+    let payload = serde_json::json!({
+        "project": project,
+        "action": "csharp",
+        "csharp": csharp,
+    });
+    unity_bridge(&payload.to_string())
+}
+
+fn diff_values(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    path: &str,
+    modified: &mut Vec<serde_json::Value>,
+    tolerance: f64,
+) {
+    match (before, after) {
+        (serde_json::Value::Object(bo), serde_json::Value::Object(ao)) => {
+            for (k, bv) in bo {
+                if let Some(av) = ao.get(k) {
+                    let next = format!("{}/{}", path, json_pointer_escape(k));
+                    diff_values(bv, av, &next, modified, tolerance);
+                }
+            }
+        }
+        (serde_json::Value::Array(ba), serde_json::Value::Array(aa)) => {
+            let common = ba.len().min(aa.len());
+            for idx in 0..common {
+                let next = format!("{}/{}", path, idx);
+                diff_values(&ba[idx], &aa[idx], &next, modified, tolerance);
+            }
+        }
+        _ => {
+            let mut changed = before != after;
+            if changed {
+                if let (Some(bn), Some(an)) = (
+                    json_value_number_or_string_to_f64(before),
+                    json_value_number_or_string_to_f64(after),
+                ) {
+                    changed = (bn - an).abs() > tolerance;
+                }
+            }
+            if changed {
+                modified.push(serde_json::json!({
+                    "path": path,
+                    "before": before,
+                    "after": after,
+                }));
+            }
+        }
+    }
+}
+
+pub fn probe_diff(args: &str) -> ToolResult {
+    let parsed = match serde_from_file_or_inline_json(args, "probe_diff") {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let before = parsed.get("before");
+    let after = parsed.get("after");
+    let (Some(before_obj), Some(after_obj)) = (before, after) else {
+        return ToolResult::err("probe_diff requires JSON with `before` and `after` objects");
+    };
+    let before_objects = before_obj
+        .get("objects")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let after_objects = after_obj
+        .get("objects")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let tolerance = parsed
+        .get("numeric_tolerance")
+        .and_then(json_value_number_or_string_to_f64)
+        .unwrap_or(0.0001)
+        .abs();
+
+    let mut before_map = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    let mut after_map = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    for item in before_objects {
+        if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+            before_map.insert(name.to_string(), item);
+        }
+    }
+    for item in after_objects {
+        if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+            after_map.insert(name.to_string(), item);
+        }
+    }
+
+    let mut added: Vec<serde_json::Value> = Vec::new();
+    let mut removed: Vec<serde_json::Value> = Vec::new();
+    let mut modified_objects: Vec<serde_json::Value> = Vec::new();
+
+    for (name, after_item) in &after_map {
+        if !before_map.contains_key(name) {
+            added.push(serde_json::json!({
+                "name": name,
+                "object": after_item,
+            }));
+        }
+    }
+    for (name, before_item) in &before_map {
+        if !after_map.contains_key(name) {
+            removed.push(serde_json::json!({
+                "name": name,
+                "object": before_item,
+            }));
+        }
+    }
+    for (name, before_item) in &before_map {
+        let Some(after_item) = after_map.get(name) else {
+            continue;
+        };
+        let mut fields = Vec::<serde_json::Value>::new();
+        diff_values(before_item, after_item, "", &mut fields, tolerance);
+        if !fields.is_empty() {
+            modified_objects.push(serde_json::json!({
+                "name": name,
+                "fields_changed": fields,
+            }));
+        }
+    }
+
+    let summary = serde_json::json!({
+        "probe_version": 1,
+        "ok": true,
+        "numeric_tolerance": tolerance,
+        "counts": {
+            "before_objects": before_map.len(),
+            "after_objects": after_map.len(),
+            "added": added.len(),
+            "removed": removed.len(),
+            "modified": modified_objects.len(),
+        },
+        "added": added,
+        "removed": removed,
+        "modified": modified_objects,
+    });
+    ToolResult::ok(summary.to_string())
+}
+
+pub fn video_capture(args: &str) -> ToolResult {
+    if !cfg!(target_os = "windows") {
+        return ToolResult::err("video_capture is currently supported on Windows only");
+    }
+
+    let req = match parse_video_capture_request(args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+
+    let duration = req
+        .duration_sec
+        .unwrap_or(VIDEO_CAPTURE_DEFAULT_DURATION_SECS)
+        .clamp(1, VIDEO_CAPTURE_MAX_DURATION_SECS);
+    let fps = req
+        .fps
+        .unwrap_or(VIDEO_CAPTURE_DEFAULT_FPS)
+        .clamp(1, VIDEO_CAPTURE_MAX_FPS);
+    let frame_count = (duration * fps).clamp(1, 1200);
+    let interval_ms = (1000u64 / fps).max(1);
+
+    let out_dir = if req.out_dir.trim().is_empty() {
+        unique_capture_dir()
+    } else {
+        PathBuf::from(req.out_dir.trim())
+    };
+    if let Err(e) = fs::create_dir_all(&out_dir) {
+        return ToolResult::err(format!(
+            "failed to create output directory '{}': {}",
+            out_dir.display(),
+            e
+        ));
+    }
+
+    let target = req.target.trim().to_ascii_lowercase();
+    let target_value = if target.is_empty() {
+        "window".to_string()
+    } else {
+        target
+    };
+    let window_title = req.window_title.trim();
+    let window_pid = req.window_pid.unwrap_or(0);
+    let out_dir_ps = powershell_escape_single_quoted(&out_dir.to_string_lossy());
+    let title_ps = powershell_escape_single_quoted(window_title);
+
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class AsiWinRect {{
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT {{ public int Left; public int Top; public int Right; public int Bottom; }}
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+}}
+"@
+
+$durationSec = {duration}
+$fps = {fps}
+$frameCount = {frame_count}
+$intervalMs = {interval_ms}
+$target = '{target}'
+$windowTitle = '{title}'
+$windowPid = [int64]{pid}
+$outDir = '{out_dir}'
+
+if (-not (Test-Path -LiteralPath $outDir)) {{
+  New-Item -ItemType Directory -Path $outDir | Out-Null
+}}
+
+function Get-AsiTargetRect([string]$target, [string]$windowTitle, [int64]$windowPid) {{
+  if ($target -eq 'fullscreen') {{
+    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    return [ordered]@{{ left=$b.Left; top=$b.Top; width=$b.Width; height=$b.Height; mode='fullscreen'; title=$null; pid=$null }}
+  }}
+  $procs = Get-Process | Where-Object {{ $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle }}
+  if ($windowPid -gt 0) {{
+    $procs = $procs | Where-Object {{ $_.Id -eq $windowPid }}
+  }}
+  if ($windowTitle) {{
+    $procs = $procs | Where-Object {{ $_.MainWindowTitle -like "*$windowTitle*" }}
+  }}
+  $targetProc = $procs | Select-Object -First 1
+  if ($null -eq $targetProc) {{
+    return $null
+  }}
+  $rect = New-Object AsiWinRect+RECT
+  $ok = [AsiWinRect]::GetWindowRect($targetProc.MainWindowHandle, [ref]$rect)
+  if (-not $ok) {{
+    return $null
+  }}
+  $w = [Math]::Max(1, $rect.Right - $rect.Left)
+  $h = [Math]::Max(1, $rect.Bottom - $rect.Top)
+  return [ordered]@{{ left=$rect.Left; top=$rect.Top; width=$w; height=$h; mode='window'; title=$targetProc.MainWindowTitle; pid=$targetProc.Id }}
+}}
+
+$firstRect = Get-AsiTargetRect -target $target -windowTitle $windowTitle -windowPid $windowPid
+if ($null -eq $firstRect) {{
+  throw "video_capture could not resolve capture target; set target=fullscreen or provide a valid window_pid/window_title"
+}}
+
+$frames = New-Object System.Collections.Generic.List[object]
+for ($i = 0; $i -lt $frameCount; $i++) {{
+  $rect = Get-AsiTargetRect -target $target -windowTitle $windowTitle -windowPid $windowPid
+  if ($null -eq $rect) {{
+    $rect = $firstRect
+  }}
+  $bmp = New-Object System.Drawing.Bitmap $rect.width, $rect.height
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($rect.left, $rect.top, 0, 0, $bmp.Size)
+$name = ('frame_{{0:D4}}.png' -f ($i + 1))
+  $path = [System.IO.Path]::Combine($outDir, $name)
+  $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+  $g.Dispose()
+  $bmp.Dispose()
+  $item = [ordered]@{{
+    index = $i + 1
+    timestamp_ms = [int]($i * $intervalMs)
+    path = $path
+    width = $rect.width
+    height = $rect.height
+  }}
+  [void]$frames.Add($item)
+  Start-Sleep -Milliseconds $intervalMs
+}}
+
+$obj = [ordered]@{{
+  capture_version = 1
+  target = $firstRect.mode
+  window_title = $firstRect.title
+  window_pid = $firstRect.pid
+  out_dir = $outDir
+  duration_sec = $durationSec
+  fps = $fps
+  frame_count = $frames.Count
+  frames = @($frames)
+}}
+$obj | ConvertTo-Json -Compress -Depth 7
+"#,
+        duration = duration,
+        fps = fps,
+        frame_count = frame_count,
+        interval_ms = interval_ms,
+        target = target_value,
+        title = title_ps,
+        pid = window_pid,
+        out_dir = out_dir_ps
+    );
+
+    run_windows_gui_powershell(&script)
+}
+
+pub fn video_keyframes(args: &str) -> ToolResult {
+    let req = match parse_video_keyframes_request(args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    let dir = req.dir.trim();
+    if dir.is_empty() {
+        return ToolResult::err("video_keyframes requires non-empty `dir`");
+    }
+    if !cfg!(target_os = "windows") {
+        return ToolResult::err("video_keyframes is currently supported on Windows only");
+    }
+    let max_frames = req
+        .max_frames
+        .unwrap_or(VIDEO_KEYFRAMES_DEFAULT_MAX)
+        .clamp(1, VIDEO_KEYFRAMES_MAX);
+    let dir_ps = powershell_escape_single_quoted(dir);
+
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Drawing
+
+$dir = '{dir}'
+$maxFrames = {max_frames}
+if (-not (Test-Path -LiteralPath $dir)) {{
+  throw "video_keyframes directory not found: $dir"
+}}
+
+$files = Get-ChildItem -LiteralPath $dir -Filter '*.png' | Sort-Object Name
+if ($files.Count -eq 0) {{
+  throw "video_keyframes found no PNG frames in: $dir"
+}}
+
+function Get-AsiFrameMetric([string]$path) {{
+  $bmp = [System.Drawing.Bitmap]::FromFile($path)
+  try {{
+    $w = $bmp.Width
+    $h = $bmp.Height
+    $stepX = [Math]::Max(1, [int]($w / 32))
+    $stepY = [Math]::Max(1, [int]($h / 32))
+    $sum = 0.0
+    $count = 0
+    for ($y = 0; $y -lt $h; $y += $stepY) {{
+      for ($x = 0; $x -lt $w; $x += $stepX) {{
+        $c = $bmp.GetPixel($x, $y)
+        $l = (0.2126 * $c.R) + (0.7152 * $c.G) + (0.0722 * $c.B)
+        $sum += $l
+        $count += 1
+      }}
+    }}
+    if ($count -le 0) {{
+      return 0.0
+    }}
+    return [double]($sum / $count)
+  }} finally {{
+    $bmp.Dispose()
+  }}
+}}
+
+$rows = New-Object System.Collections.Generic.List[object]
+$prevMetric = $null
+$idx = 0
+foreach ($f in $files) {{
+  $idx += 1
+  $metric = Get-AsiFrameMetric $f.FullName
+  $delta = 0.0
+  if ($null -ne $prevMetric) {{
+    $delta = [Math]::Abs([double]$metric - [double]$prevMetric)
+  }}
+  $prevMetric = $metric
+  [void]$rows.Add([ordered]@{{
+    index = $idx
+    name = $f.Name
+    path = $f.FullName
+    brightness_metric = [Math]::Round($metric, 6)
+    delta_from_prev = [Math]::Round($delta, 6)
+  }})
+}}
+
+$selected = New-Object System.Collections.Generic.List[object]
+$seen = @{{}}
+
+function Add-AsiSelected($row) {{
+  if ($null -eq $row) {{ return }}
+  if ($seen.ContainsKey($row.path)) {{ return }}
+  $seen[$row.path] = $true
+  [void]$selected.Add($row)
+}}
+
+Add-AsiSelected($rows[0])
+if ($rows.Count -gt 1) {{
+  Add-AsiSelected($rows[$rows.Count - 1])
+}}
+
+$topChanged = $rows | Sort-Object delta_from_prev -Descending
+foreach ($r in $topChanged) {{
+  if ($selected.Count -ge $maxFrames) {{ break }}
+  Add-AsiSelected($r)
+}}
+
+if ($selected.Count -lt $maxFrames) {{
+  $step = [Math]::Max(1, [int][Math]::Floor($rows.Count / [Math]::Max(1, $maxFrames)))
+  for ($i = 0; $i -lt $rows.Count -and $selected.Count -lt $maxFrames; $i += $step) {{
+    Add-AsiSelected($rows[$i])
+  }}
+}}
+
+$selected = $selected | Sort-Object index | Select-Object -First $maxFrames
+$obj = [ordered]@{{
+  keyframes_version = 1
+  dir = $dir
+  total_frames = $rows.Count
+  selected_frames = @($selected)
+  selected_count = @($selected).Count
+}}
+$obj | ConvertTo-Json -Compress -Depth 8
+"#,
+        dir = dir_ps,
+        max_frames = max_frames
+    );
+    run_windows_gui_powershell(&script)
 }
 
 pub fn unity_bridge(args: &str) -> ToolResult {
@@ -3373,8 +4305,14 @@ pub fn tool_index() -> String {
         "- type <text>",
         "- read_screen_text",
         "- ue5_bridge <json:{script,project?}>",
+        "- ue5_scene_probe <json:{project,max_objects?}>",
         "- blender_bridge <json:{script,project?}>",
+        "- blender_scene_probe <json:{project?,script?}>",
         "- unity_bridge <json:{script,project}>",
+        "- unity_scene_probe <json:{project,max_objects?,include_inactive?}>",
+        "- probe_diff <json:{before,after,numeric_tolerance?}>",
+        "- video_capture <json:{duration_sec?,fps?,target?,window_title?,window_pid?,out_dir?}>",
+        "- video_keyframes <json:{dir,max_frames?}>",
     ]
     .join("\n")
 }
@@ -3401,6 +4339,9 @@ mod tests {
         windows_missing_yarn_error, windows_permission_error, extract_json_string_arg,
         windows_python_alias_error, windows_shell_error_hint,
         parse_bridge_request, require_script, unity_bridge, BridgeRequest,
+        parse_video_capture_request, parse_video_keyframes_request,
+        parse_unity_scene_probe_request,
+        probe_diff,
     };
     use std::env;
     use std::fs;
@@ -4096,6 +5037,88 @@ name='asi'
         let raw = r#"{"project":"D:/u/p","action":"create_terrain","size":[600,40,600]}"#;
         let req = parse_bridge_request(raw).expect("parse ok");
         assert_eq!(req.size.as_deref(), Some(&[600.0, 40.0, 600.0][..]));
+    }
+
+    #[test]
+    fn parse_video_capture_request_defaults_when_empty() {
+        let req = parse_video_capture_request("").expect("parse");
+        assert_eq!(req.duration_sec, None);
+        assert_eq!(req.fps, None);
+        assert!(req.target.is_empty());
+    }
+
+    #[test]
+    fn parse_video_capture_request_accepts_json_shape() {
+        let req = parse_video_capture_request(
+            r#"{"duration_sec":8,"fps":2,"target":"window","window_title":"Unreal Editor","window_pid":1234}"#,
+        )
+        .expect("parse");
+        assert_eq!(req.duration_sec, Some(8));
+        assert_eq!(req.fps, Some(2));
+        assert_eq!(req.target, "window");
+        assert_eq!(req.window_title, "Unreal Editor");
+        assert_eq!(req.window_pid, Some(1234));
+    }
+
+    #[test]
+    fn parse_video_keyframes_request_accepts_json_shape() {
+        let req = parse_video_keyframes_request(r#"{"dir":"C:/temp/cap","max_frames":9}"#)
+            .expect("parse");
+        assert_eq!(req.dir, "C:/temp/cap");
+        assert_eq!(req.max_frames, Some(9));
+    }
+
+    #[test]
+    fn parse_unity_scene_probe_request_accepts_json_shape() {
+        let req = parse_unity_scene_probe_request(
+            r#"{"project":"D:/Unity/P","max_objects":256,"include_inactive":false}"#,
+        )
+        .expect("parse");
+        assert_eq!(req.project, "D:/Unity/P");
+        assert_eq!(req.max_objects, Some(256));
+        assert_eq!(req.include_inactive, Some(false));
+    }
+
+    #[test]
+    fn probe_diff_detects_added_removed_and_modified() {
+        let args = r#"{
+  "before": {
+    "objects": [
+      {"name":"Cube","location":[0,0,0],"scale":[1,1,1]},
+      {"name":"Camera","location":[0,-5,2]}
+    ]
+  },
+  "after": {
+    "objects": [
+      {"name":"Cube","location":[1,0,0],"scale":[1,1,1]},
+      {"name":"Light","location":[2,2,4]}
+    ]
+  }
+}"#;
+        let res = probe_diff(args);
+        assert!(res.ok, "{}", res.output);
+        let parsed: serde_json::Value = serde_json::from_str(&res.output).expect("json");
+        assert_eq!(
+            parsed
+                .get("counts")
+                .and_then(|v| v.get("added"))
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .get("counts")
+                .and_then(|v| v.get("removed"))
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .get("counts")
+                .and_then(|v| v.get("modified"))
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 **A modern terminal coding agent in Rust.** Single binary. No Node.js runtime required, and no npm install step. Runs against **DeepSeek**, **OpenAI**, or **Claude** with the same workflow.
 
-> **ASI Code 2.0 is coming soon.** The 2.0 line moves beyond pure code editing into desktop and professional-software control: native GUI automation (screenshot / window targeting / synthetic input / on-screen OCR), live engine bridges for Unreal Engine 5, Blender, and Unity (drive the already-open Editor via `[InitializeOnLoad]` C# drops), and a smarter auto-loop that no longer mistakes successful read-only investigation for "no progress." See [What's New in 2.0](#whats-new-in-20-preview) below.
+> **ASI Code 2.0 is coming soon.** The 2.0 line moves beyond pure code editing into desktop and professional-software control: native GUI automation (screenshot / window targeting / synthetic input / on-screen OCR), live engine bridges for Unreal Engine 5, Blender, and Unity (drive the already-open Editor via `[InitializeOnLoad]` C# drops), 3D-aware scene probes plus `probe_diff` for deterministic structural verification, frame-folder video capture with keyframe selection for temporal context, and a smarter auto-loop that no longer mistakes successful read-only investigation for "no progress." See [What's New in 2.0](#whats-new-in-20-preview) below.
 
 Inspired by modern coding-agent CLIs, with a similar workflow and UX: REPL with slash commands, streaming output, auto-tool loop, work / code / secure / review modes, sub-agents, MCP server support, plugin system, agent skills, cron jobs, git worktrees, sandbox + audit log, and a 60+ command surface.
 
@@ -117,6 +117,36 @@ Bridge environment variables:
 - `ASI_UNITY_EDITOR` / `UNITY_EDITOR` — Unity binary
 - `ASI_BRIDGE_TIMEOUT_SECS` — wait budget for batch calls and for the `csharp` result-file poll (default 120 s)
 
+### Tier 3 — 3D-aware probes and temporal capture
+
+The bridge layer can drive engines, but "drive" alone is not enough — the model also needs to *see* what is in the scene before it acts, and *verify* what changed after. Frames of a viewport are interpretation; structured scene data is truth. Tier 3 adds both.
+
+Six new tools, all exposed as native `tool_use` / `tool_calls` and `/toolcall` entries:
+
+| Tool | Purpose |
+|---|---|
+| `blender_scene_probe` | Dump active Blender scene (objects, transforms, cameras, lights, actions, materials) as JSON via `bpy`. |
+| `ue5_scene_probe` | Dump UE5 level state (actor list, transforms, materials, light/camera params) as JSON via Unreal Python. |
+| `unity_scene_probe` | Dump active Unity scene as JSON by executing C# in the live Editor (same `[InitializeOnLoad]` drop pattern as `unity_bridge action=csharp`). |
+| `probe_diff` | Deterministic structural diff between two probe payloads. Returns `added` / `removed` / `modified` (with the specific fields that changed) instead of a free-text "looks different." |
+| `video_capture` | Capture a frame sequence to a directory (`fps=2`, `duration_sec=6` defaults). v1 deliberately skips MP4 encoding — frames-on-disk is what the model actually consumes, and removes an external dependency. |
+| `video_keyframes` | Pick a compact subset from a frame directory (default `max_frames=12`). Selection mixes boundary frames, change-magnitude ranking, and equidistant fill — so the model gets the most informative frames, not random samples. |
+
+The system prompt steers the agent to **probes first, video second**: `blender_scene_probe` / `ue5_scene_probe` / `unity_scene_probe` are deterministic ground truth, while `video_capture` + `video_keyframes` are visual evidence used only when the structural data is not enough on its own.
+
+Example loop — make a Unity edit, verify it structurally, capture supporting frames only on uncertainty:
+
+```text
+/toolcall unity_scene_probe {"project":"D:/unity/My project"}                # -> before.json
+/toolcall unity_bridge {"project":"D:/unity/My project","action":"csharp","csharp":"GameObject.CreatePrimitive(PrimitiveType.Cube).transform.position = new Vector3(0,1,0);"}
+/toolcall unity_scene_probe {"project":"D:/unity/My project"}                # -> after.json
+/toolcall probe_diff {"before":{...},"after":{...}}                          # -> {added:[Cube], modified:[]}
+/toolcall video_capture {"duration_sec":4,"fps":2,"target":"window","window_title":"Unity"}
+/toolcall video_keyframes {"dir":"<frame dir from previous step>","max_frames":8}
+```
+
+Why frames-on-disk instead of MP4: vision-capable LLMs ingest images, not video. Encoding to MP4 just to extract PNGs again is wasted work; the frame-folder hands the keyframe selector exactly what it needs and avoids pulling in ffmpeg as a runtime dependency.
+
 ### Auto-loop no-progress detector — read-only work now counts
 
 The auto-loop's "no progress across too many rounds" circuit breaker previously only counted **file mutations** as progress. Read-heavy tasks (screenshot, find_window, bash inspection, web_search, OCR, computer-control sequences) would trip the breaker mid-investigation even while the model was making real headway.
@@ -127,8 +157,9 @@ The detector now classifies each round as one of `FilesChanged` / `ReadOnlyToolS
 
 - **Tier 1 (shipped):** screen capture, window targeting, click, typing, on-screen OCR.
 - **Tier 2 (shipped):** UE5 / Blender / Unity bridges; Unity has live-editor C# drop.
-- **Tier 3 (next):** mobile and cross-device remote — a small relay so the CLI can be triggered from a phone or another machine.
-- **Tier 4 (deliberately not pursued in 2.0):** AGI-level autonomous creative work. The bridge layer is the leverage — when the underlying models get stronger, every existing bridge inherits the new capability automatically.
+- **Tier 3 (shipped):** 3D-aware scene probes for UE5 / Blender / Unity, deterministic `probe_diff`, frame-folder `video_capture` + `video_keyframes` for temporal context.
+- **Tier 4 (next):** mobile and cross-device remote — a small relay so the CLI can be triggered from a phone or another machine.
+- **Tier 5 (deliberately not pursued in 2.0):** AGI-level autonomous creative work. The bridge layer is the leverage — when the underlying models get stronger, every existing bridge inherits the new capability automatically.
 
 ## Quick Start
 

@@ -56,8 +56,14 @@ pub fn guard_tool_path_access(
         | "find_window"
         | "read_screen_text"
         | "ue5_bridge"
+        | "ue5_scene_probe"
         | "blender_bridge"
-        | "unity_bridge" => {
+        | "blender_scene_probe"
+        | "unity_bridge"
+        | "unity_scene_probe"
+        | "video_capture"
+        | "video_keyframes"
+        | "probe_diff" => {
             return Ok(());
         }
         "glob_search" => {

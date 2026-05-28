@@ -2324,8 +2324,12 @@ fn tool_requires_user_confirmation(tool: &str) -> bool {
             | "type"
             | "type_text"
             | "ue5_bridge"
+            | "ue5_scene_probe"
             | "blender_bridge"
+            | "blender_scene_probe"
             | "unity_bridge"
+            | "unity_scene_probe"
+            | "video_capture"
     )
 }
 
@@ -2517,8 +2521,12 @@ fn score_auto_review_risk(tool: &str, args: &str) -> (AutoReviewSeverity, String
         | "type"
         | "type_text"
         | "ue5_bridge"
+        | "ue5_scene_probe"
         | "blender_bridge"
-        | "unity_bridge" => (
+        | "blender_scene_probe"
+        | "unity_bridge"
+        | "unity_scene_probe"
+        | "video_capture" => (
             AutoReviewSeverity::High,
             "desktop input control requested".to_string(),
         ),
@@ -2863,8 +2871,14 @@ fn is_known_tool(name: &str) -> bool {
             | "type_text"
             | "read_screen_text"
             | "ue5_bridge"
+            | "ue5_scene_probe"
             | "blender_bridge"
+            | "blender_scene_probe"
             | "unity_bridge"
+            | "unity_scene_probe"
+            | "probe_diff"
+            | "video_capture"
+            | "video_keyframes"
     )
 }
 fn compact_tool_result_for_history(tool: &str, text: &str) -> String {
@@ -3086,8 +3100,14 @@ fn normalize_tool_args(name: &str, args: &str) -> String {
         | "type"
         | "type_text"
         | "ue5_bridge"
+        | "ue5_scene_probe"
         | "blender_bridge"
-        | "unity_bridge" => {
+        | "blender_scene_probe"
+        | "unity_bridge"
+        | "unity_scene_probe"
+        | "probe_diff"
+        | "video_capture"
+        | "video_keyframes" => {
             let sanitized = strip_accidental_trailing_closing_parens(trimmed);
             strip_surrounding_quotes(&sanitized).to_string()
         }
@@ -3293,7 +3313,9 @@ fn deny_reason(
         | "web_fetch"
         | "screenshot"
         | "find_window"
-        | "read_screen_text" => 0,
+        | "read_screen_text"
+        | "probe_diff"
+        | "video_keyframes" => 0,
         "write_file"
         | "edit_file"
         | "bash"
@@ -3303,8 +3325,12 @@ fn deny_reason(
         | "type"
         | "type_text"
         | "ue5_bridge"
+        | "ue5_scene_probe"
         | "blender_bridge"
-        | "unity_bridge" => 1,
+        | "blender_scene_probe"
+        | "unity_bridge"
+        | "unity_scene_probe"
+        | "video_capture" => 1,
         _ => 2,
     };
     if lvl < required {
@@ -4019,8 +4045,13 @@ mod tests {
         assert!(tool_requires_user_confirmation("edit_file"));
         assert!(tool_requires_user_confirmation("click"));
         assert!(tool_requires_user_confirmation("type_text"));
+        assert!(tool_requires_user_confirmation("blender_scene_probe"));
+        assert!(tool_requires_user_confirmation("ue5_scene_probe"));
+        assert!(tool_requires_user_confirmation("unity_scene_probe"));
+        assert!(tool_requires_user_confirmation("video_capture"));
         assert!(!tool_requires_user_confirmation("read_file"));
         assert!(!tool_requires_user_confirmation("screenshot"));
+        assert!(!tool_requires_user_confirmation("video_keyframes"));
     }
 
     #[test]

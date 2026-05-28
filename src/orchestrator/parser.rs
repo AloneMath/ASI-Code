@@ -2630,6 +2630,19 @@ fn starts_with_named_arg_fragment(rest: &str) -> bool {
             | "y"
             | "script"
             | "project"
+            | "max_objects"
+            | "include_inactive"
+            | "before"
+            | "after"
+            | "numeric_tolerance"
+            | "duration_sec"
+            | "fps"
+            | "target"
+            | "window_title"
+            | "window_pid"
+            | "out_dir"
+            | "dir"
+            | "max_frames"
     )
 }
 
@@ -2667,8 +2680,14 @@ fn is_known_tool_name(name: &str) -> bool {
             | "type_text"
             | "read_screen_text"
             | "ue5_bridge"
+            | "ue5_scene_probe"
             | "blender_bridge"
+            | "blender_scene_probe"
             | "unity_bridge"
+            | "unity_scene_probe"
+            | "probe_diff"
+            | "video_capture"
+            | "video_keyframes"
     )
 }
 
@@ -2800,8 +2819,14 @@ fn parse_function_style(rest: &str) -> Option<(String, String)> {
             | "type_text"
             | "read_screen_text"
             | "ue5_bridge"
+            | "ue5_scene_probe"
             | "blender_bridge"
+            | "blender_scene_probe"
             | "unity_bridge"
+            | "unity_scene_probe"
+            | "probe_diff"
+            | "video_capture"
+            | "video_keyframes"
     ) {
         return None;
     }

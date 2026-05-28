@@ -317,6 +317,17 @@ fn loop_info(mode: LoopMode, ui: Option<&Ui>, message: &str) {
     }
 }
 
+fn loop_emit_progress(mode: LoopMode, ui: Option<&Ui>, current: usize, total: usize) {
+    if !matches!(mode, LoopMode::ReplVerbose) {
+        return;
+    }
+    if let Some(panel) = ui {
+        if let Some(bar) = panel.progress_bar(current, total) {
+            println!("{}", bar);
+        }
+    }
+}
+
 fn run_turn_for_mode(
     rt: &mut Runtime,
     cfg: &AppConfig,
@@ -379,7 +390,7 @@ fn render_turn_output_for_mode(
                 panel.tool_panel(
                     &name,
                     &status,
-                    &compact_tool_panel_body(&name, &status, &body)
+                    &compact_tool_panel_body(panel, &name, &status, &body)
                 )
             );
         } else {
@@ -1104,6 +1115,7 @@ fn run_tool_loop_core(
                     }
 
                     let tool_results = run_parallel_batch_tool_results(rt, constraints, &commands);
+                    let parallel_total = commands.len();
                     for (idx, tool_result) in tool_results.into_iter().enumerate() {
                         let command = commands
                             .get(idx)
@@ -1143,6 +1155,7 @@ fn run_tool_loop_core(
                             false,
                             false,
                         );
+                        loop_emit_progress(mode, ui, idx + 1, parallel_total);
                     }
                 }
             } else {
@@ -1157,6 +1170,8 @@ fn run_tool_loop_core(
                     );
                 }
 
+                let sequential_total = batch.calls.len();
+                let mut sequential_done = 0usize;
                 for call in batch.calls {
                     if let Some(reason) = engine.stop_reason(steps, consecutive_failures) {
                         loop_info(mode, ui, &format!("auto-agent stopped: {}", reason));
@@ -1204,6 +1219,8 @@ fn run_tool_loop_core(
                         false,
                         false,
                     );
+                    sequential_done += 1;
+                    loop_emit_progress(mode, ui, sequential_done, sequential_total);
                 }
             }
 
