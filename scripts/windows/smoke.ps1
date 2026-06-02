@@ -24,7 +24,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke.ps1 
 
 param(
     [string]$AsiExe = "$(Join-Path $PSScriptRoot "..\..\target\release\asi.exe")",
-    [string]$Project = "D:\Code\Rust",
+    [string]$Project = "$(Join-Path $PSScriptRoot "..\..")",
     [string]$Repo = "D:\Code\rustbpe",
     [ValidateSet("strict", "risk", "gateway")]
     [string]$Mode = "strict",

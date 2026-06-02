@@ -239,7 +239,7 @@ The journal piggybacks on the existing single-file checkpoint, so disk footprint
 ## Quick Start
 
 ```powershell
-cd "D:\Code\Rust"
+cd "<path\to\ASI-Code>"
 cargo run --offline -- repl --project "D:\Code\YourProject" --provider deepseek --model deepseek-v4-pro
 ```
 ## Real CLI Execution Example
@@ -310,7 +310,7 @@ This demonstrates three core behaviors:
 Install ASI Code as a standalone app (`asi.exe`) with one command:
 
 ```powershell
-cd "D:\Code\Rust"
+cd "<path\to\ASI-Code>"
 powershell -ExecutionPolicy Bypass -File .\scripts\windows\install_asi.ps1 -BuildRelease
 ```
 
@@ -337,7 +337,7 @@ Detailed guide: INSTALL_WINDOWS.md
 ## VS Code PowerShell Quick Launch (Windows)
 
 ```powershell
-cd "D:\Code\Rust"
+cd "<path\to\ASI-Code>"
 .\start_asi.ps1
 ```
 
@@ -414,10 +414,10 @@ cargo run --offline -- prompt "review this repo" --output-format json
 cargo run --offline -- prompt "review this repo" --output-format jsonl
 cargo run --offline -- repl --speed sprint
 cargo run --offline -- prompt "review this repo" --speed deep --output-format json
-cargo run --offline -- bench --provider deepseek --model deepseek-reasoner --project "D:\Code\Rust" --suite core --agent-max-steps 8 --repeat 1 --out-dir bench_reports
-cargo run --release -- bench --provider deepseek-reasoner --model deepseek-reasoner --project "D:\Code\Rust" --suite gpt53-proxy6d --agent-max-steps 4 --repeat 3 --out-dir bench_reports
+cargo run --offline -- bench --provider deepseek --model deepseek-reasoner --project "<path\to\ASI-Code>" --suite core --agent-max-steps 8 --repeat 1 --out-dir bench_reports
+cargo run --release -- bench --provider deepseek-reasoner --model deepseek-reasoner --project "<path\to\ASI-Code>" --suite gpt53-proxy6d --agent-max-steps 4 --repeat 3 --out-dir bench_reports
 cargo run --offline -- sessions --limit 20
-cargo run --offline -- self-update --source "D:\Code\Rust\dist\asi-code-windows-x64-0.3.0.zip"
+cargo run --offline -- self-update --source "<path\to\ASI-Code>\dist\asi-code-windows-x64-0.3.0.zip"
 cargo run --offline -- self-update --source "https://example.com/asi-code-windows-x64-0.3.0.zip" --sha256 "<sha256>"
 cargo run --offline -- config --telemetry-enabled true --safe-shell-mode true --undercover-mode true
 cargo run --offline -- config --disable-web-tools true --disable-bash-tool false
@@ -862,7 +862,7 @@ Machine-consumable example:
 cargo run --release -- prompt "/review inspect parser" `
   --provider openai `
   --model gpt-5.3-codex `
-  --project "D:\Code\Rust" `
+  --project "<path\to\ASI-Code>" `
   --output-format json | `
   ConvertFrom-Json | `
   Select-Object -ExpandProperty review | `
@@ -875,7 +875,7 @@ Fast review-only JSON (no wrapper envelope):
 cargo run --release -- prompt "/review inspect parser --json-only" `
   --provider openai `
   --model gpt-5.3-codex `
-  --project "D:\Code\Rust"
+  --project "<path\to\ASI-Code>"
 ```
 
 Optional strict CI gate for `/review --json-only`:
@@ -886,7 +886,7 @@ $env:ASI_REVIEW_JSON_ONLY_STRICT_FAIL_EXIT="true"
 cargo run --release -- prompt "/review inspect parser --json-only" `
   --provider openai `
   --model gpt-5.3-codex `
-  --project "D:\Code\Rust" `
+  --project "<path\to\ASI-Code>" `
   --output-format json
 ```
 
@@ -908,7 +908,7 @@ You can run OpenAI/DeepSeek flows independently without requiring Claude credent
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_api_compat.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
   -Project "D:\test_code" `
   -SkipOpenAi `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
@@ -919,7 +919,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_api_
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_api_compat.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
   -Project "D:\test_code" `
   -SkipDeepSeek `
   -OpenAiBaseUrl "https://api.openai.com/v1" `
@@ -933,7 +933,7 @@ DeepSeek example:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_gateway.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
   -Project "D:\test_code" `
   -Provider deepseek `
   -ApiKey "<YOUR_DEEPSEEK_KEY>" `
@@ -944,7 +944,7 @@ OpenAI example:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_gateway.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
   -Project "D:\test_code" `
   -Provider openai `
   -BaseUrl "https://api.openai.com/v1" `
@@ -958,7 +958,7 @@ Fast DeepSeek gateway path (skip tool turn for speed):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_all.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
   -Project "D:\test_code" `
   -Repo "D:\Code\rustbpe" `
   -Quick `
@@ -974,8 +974,8 @@ Optional auto-summary for smoke reports:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_all.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -SkipApiCompat -SkipProviderModel -SkipTokenizer -SkipCheckpoint -SkipGateway `
   -ReportJsonPath ".\artifacts\smoke_all.json" `
@@ -986,8 +986,8 @@ Optional custom summary output path:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_all.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -SkipApiCompat -SkipProviderModel -SkipTokenizer -SkipCheckpoint -SkipGateway `
   -ReportJsonPath ".\artifacts\smoke_all.json" `
@@ -999,8 +999,8 @@ Strict profile (CI parity) example for `smoke_all.ps1`:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_all.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -StrictProfile `
   -SkipApiCompat -SkipProviderModel -SkipTokenizer -SkipCheckpoint -SkipGateway `
@@ -1031,7 +1031,7 @@ Use `run_smoke_recipes.ps1` to avoid manual command assembly:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_recipes.ps1 `
   -Provider deepseek `
   -Recipe smoke-all-gateway `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
   -Project "D:\test_code" `
   -Repo "D:\Code\rustbpe" `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
@@ -1087,8 +1087,8 @@ One-command risk review + gateway (relaxed schema gate):
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_recipes.ps1 `
   -Provider deepseek `
   -Recipe smoke-all-gateway-risk `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
   -ReportDir ".\artifacts" `
@@ -1102,7 +1102,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_
   -Provider deepseek `
   -Recipe smoke-all-gateway-risk `
   -AsiExe ".\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
   -ReportDir ".\artifacts\risk_recipe_live" `
@@ -1117,7 +1117,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_
   -Provider openai `
   -Recipe smoke-all-gateway-risk `
   -AsiExe ".\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -OpenAiApiKey "<YOUR_OPENAI_KEY>" `
   -OpenAiBaseUrl "https://api.openai.com/v1" `
@@ -1130,8 +1130,8 @@ Direct review JSON smoke example:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_review_json.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
   -Provider deepseek `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
   -Model "deepseek-reasoner" `
@@ -1146,8 +1146,8 @@ Direct prompt JSONL smoke example:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_prompt_jsonl.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
   -Provider deepseek `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
   -Model "deepseek-reasoner" `
@@ -1160,8 +1160,8 @@ One-command artifacts + summary via recipe runner:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_recipes.ps1 `
   -Provider deepseek `
   -Recipe review-json `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
   -ReviewJsonPromptAutoTools off `
   -ReviewJsonPromptEnvelope off `
@@ -1254,9 +1254,9 @@ Hook matrix smoke (event handler config) example:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_hook_matrix.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
-  -ReportJsonPath "D:\Code\Rust\artifacts\smoke_hook_matrix.json"
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
+  -ReportJsonPath "<path\to\ASI-Code>\artifacts\smoke_hook_matrix.json"
 ```
 
 Recipe runner equivalent:
@@ -1264,30 +1264,30 @@ Recipe runner equivalent:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_recipes.ps1 `
   -Recipe hook-matrix `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
-  -ReportDir "D:\Code\Rust\artifacts"
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
+  -ReportDir "<path\to\ASI-Code>\artifacts"
 ```
 
 Hooks CLI advanced smoke example:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_hooks_cli_advanced.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
-  -ReportJsonPath "D:\Code\Rust\artifacts\smoke_hooks_cli_advanced.json"
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
+  -Project "<path\to\ASI-Code>" `
+  -ReportJsonPath "<path\to\ASI-Code>\artifacts\smoke_hooks_cli_advanced.json"
 ```
 
 ### 6) Subagent JSON Smoke (spawn/list/wait envelope checks)
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_subagent.ps1 `
-  -AsiExe "D:\Code\Rust\target\release\asi.exe" `
+  -AsiExe "<path\to\ASI-Code>\target\release\asi.exe" `
   -Project "D:\test-cli" `
   -Provider deepseek `
   -Model deepseek-reasoner `
   -OutputMode json `
-  -ReportJsonPath "D:\Code\Rust\artifacts\smoke_subagent.json"
+  -ReportJsonPath "<path\to\ASI-Code>\artifacts\smoke_subagent.json"
 ```
 - `-OutputMode` supports `json` (default) and `jsonl`.
 - For JSONL mode use: `-OutputMode jsonl` (parses `agent.<command>` events).

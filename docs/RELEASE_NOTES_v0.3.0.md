@@ -47,7 +47,7 @@ Claude Code–style workflow.
 ### Install (Windows)
 
 ```powershell
-cd D:\Code\Rust
+cd <path\to\ASI-Code>
 powershell -ExecutionPolicy Bypass -File .\scripts\windows\install_asi.ps1 -BuildRelease
 ```
 
@@ -162,7 +162,7 @@ MIT. Use, modify, fork, embed, sell — all OK. Just keep the copyright notice.
 ### 安装（Windows）
 
 ```powershell
-cd D:\Code\Rust
+cd <path\to\ASI-Code>
 powershell -ExecutionPolicy Bypass -File .\scripts\windows\install_asi.ps1 -BuildRelease
 ```
 

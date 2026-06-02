@@ -26,7 +26,7 @@ Installer behavior:
 
 ## 2) Install from Source Repo (PowerShell Script)
 
-From `D:\Code\Rust`:
+From `<path\to\ASI-Code>`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\windows\install_asi.ps1 -BuildRelease
@@ -76,14 +76,14 @@ Portable ZIP launch entries (after extraction):
 Use CLI self-update with local zip/exe or remote URL:
 
 ```powershell
-asi self-update --source "D:\Code\Rust\dist\asi-code-windows-x64-0.3.0.zip"
+asi self-update --source "<path\to\ASI-Code>\dist\asi-code-windows-x64-0.3.0.zip"
 asi self-update --source "https://example.com/asi-code-windows-x64-0.3.0.zip" --sha256 "<sha256>"
 ```
 
 Optional restart into REPL after update:
 
 ```powershell
-asi self-update --source "D:\Code\Rust\dist\asi-code-windows-x64-0.3.0.zip" --restart
+asi self-update --source "<path\to\ASI-Code>\dist\asi-code-windows-x64-0.3.0.zip" --restart
 ```
 
 ## 6) Uninstall
@@ -140,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\run_smoke_
   -Provider deepseek `
   -Recipe smoke-all-strict `
   -AsiExe ".\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -DeepSeekApiKey "<YOUR_DEEPSEEK_KEY>" `
   -ReportDir ".\artifacts\strict_ci" `
@@ -159,7 +159,7 @@ Direct strict-profile smoke_all example:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\smoke_all.ps1 `
   -AsiExe ".\target\release\asi.exe" `
-  -Project "D:\Code\Rust" `
+  -Project "<path\to\ASI-Code>" `
   -Repo "D:\Code\rustbpe" `
   -StrictProfile `
   -SkipApiCompat -SkipProviderModel -SkipTokenizer -SkipCheckpoint -SkipGateway `

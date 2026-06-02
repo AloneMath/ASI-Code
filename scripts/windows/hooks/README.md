@@ -18,21 +18,21 @@ $env:ASI_HOOKS_ENABLED='1'
 $env:ASI_HOOK_JSON='1'
 $env:ASI_HOOK_TIMEOUT_SECS='10'
 
-$env:ASI_HOOK_PRE_TOOL_USE='& "D:\Code\Rust\scripts\windows\hooks\pre_tool_use.ps1"'
-$env:ASI_HOOK_PERMISSION_REQUEST='& "D:\Code\Rust\scripts\windows\hooks\permission_request.ps1"'
-$env:ASI_HOOK_POST_TOOL_USE='& "D:\Code\Rust\scripts\windows\hooks\post_tool_use.ps1"'
-$env:ASI_HOOK_SESSION_START='& "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_USER_PROMPT_SUBMIT='& "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_STOP='& "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_SUBAGENT_STOP='& "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_PRE_COMPACT='& "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_POST_COMPACT='& "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_PRE_TOOL_USE='& "<path\to\ASI-Code>\scripts\windows\hooks\pre_tool_use.ps1"'
+$env:ASI_HOOK_PERMISSION_REQUEST='& "<path\to\ASI-Code>\scripts\windows\hooks\permission_request.ps1"'
+$env:ASI_HOOK_POST_TOOL_USE='& "<path\to\ASI-Code>\scripts\windows\hooks\post_tool_use.ps1"'
+$env:ASI_HOOK_SESSION_START='& "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_USER_PROMPT_SUBMIT='& "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_STOP='& "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_SUBAGENT_STOP='& "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_PRE_COMPACT='& "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_POST_COMPACT='& "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
 ```
 
 Then run:
 
 ```powershell
-cargo run --release -- repl --provider openai --model gpt-5.3-codex --project D:\Code\Rust --no-setup
+cargo run --release -- repl --provider openai --model gpt-5.3-codex --project <path\to\ASI-Code> --no-setup
 ```
 
 ## Disable quickly
@@ -68,15 +68,15 @@ $env:ASI_HOOKS_ENABLED='1'
 $env:ASI_HOOK_JSON='1'
 $env:ASI_HOOK_TIMEOUT_SECS='10'
 
-$env:ASI_HOOK_PRE_TOOL_USE='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\pre_tool_use.ps1"'
-$env:ASI_HOOK_PERMISSION_REQUEST='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\permission_request_strict.ps1"'
-$env:ASI_HOOK_POST_TOOL_USE='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\post_tool_use.ps1"'
-$env:ASI_HOOK_SESSION_START='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_USER_PROMPT_SUBMIT='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_STOP='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_SUBAGENT_STOP='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_PRE_COMPACT='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
-$env:ASI_HOOK_POST_COMPACT='powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Code\Rust\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_PRE_TOOL_USE='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\pre_tool_use.ps1"'
+$env:ASI_HOOK_PERMISSION_REQUEST='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\permission_request_strict.ps1"'
+$env:ASI_HOOK_POST_TOOL_USE='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\post_tool_use.ps1"'
+$env:ASI_HOOK_SESSION_START='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_USER_PROMPT_SUBMIT='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_STOP='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_SUBAGENT_STOP='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_PRE_COMPACT='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
+$env:ASI_HOOK_POST_COMPACT='powershell -NoProfile -ExecutionPolicy Bypass -File "<path\to\ASI-Code>\scripts\windows\hooks\lifecycle_event.ps1"'
 
 $env:ASI_HOOK_BASH_ALLOW_PREFIXES='cargo check;cargo test;git status;git diff;python -m pytest'
 ```
@@ -110,7 +110,7 @@ You can combine the legacy env hooks with a JSON handler matrix:
 
 ```powershell
 $env:ASI_HOOKS_ENABLED='1'
-$env:ASI_HOOK_CONFIG_PATH='D:\Code\Rust\scripts\windows\hooks\hooks.config.example.json'
+$env:ASI_HOOK_CONFIG_PATH='<path\to\ASI-Code>\scripts\windows\hooks\hooks.config.example.json'
 ```
 
 Handler fields:

@@ -9,7 +9,7 @@ done this before.
       root.
 - [ ] No API keys in any tracked file:
       ```powershell
-      cd D:\Code\Rust
+      cd <path\to\ASI-Code>
       Select-String -Path *.* -Pattern "sk-[a-zA-Z0-9]{30,}" -Recurse -ErrorAction SilentlyContinue
       ```
       Should return **nothing**. If it does, redact and re-grep.
@@ -47,7 +47,7 @@ Go to <https://github.com/new>:
 ## 4. Local git init + first push
 
 ```powershell
-cd D:\Code\Rust
+cd <path\to\ASI-Code>
 git init
 git branch -M main
 git status                   # look before adding
