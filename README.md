@@ -1,5 +1,9 @@
 ﻿# ASI Code
 
+[![Sponsor on 爱发电](https://img.shields.io/badge/%E7%88%B1%E5%8F%91%E7%94%B5-Sponsor-946ce6?style=flat-square)](https://afdian.com/a/AloneMath)
+[![GitHub Stars](https://img.shields.io/github/stars/AloneMath/ASI-Code?style=flat-square)](https://github.com/AloneMath/ASI-Code/stargazers)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+
 **A modern terminal coding agent in Rust.** Single binary. No Node.js runtime required, and no npm install step. Runs against **DeepSeek**, **OpenAI**, or **Claude** with the same workflow.
 
 > **ASI Code 2.0 is coming soon.** The 2.0 line moves beyond pure code editing into desktop and professional-software control: native GUI automation (screenshot / window targeting / synthetic input / on-screen OCR), live engine bridges for Unreal Engine 5, Blender, and Unity (drive the already-open Editor via `[InitializeOnLoad]` C# drops), 3D-aware scene probes plus `probe_diff` for deterministic structural verification, frame-folder video capture with keyframe selection for temporal context, and a smarter auto-loop that no longer mistakes successful read-only investigation for "no progress." See [What's New in 2.0](#whats-new-in-20-preview) below.
@@ -1407,6 +1411,33 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE).
 - Positioning: keep individual developer productivity open; monetize team/enterprise governance and reliability.
 
 See: [GITHUB_REPO_COPY_BILINGUAL.md](GITHUB_REPO_COPY_BILINGUAL.md)
+
+## Support the Project / 支持作者
+
+ASI Code is **MIT-licensed** and the CLI is **fully free** — every feature in this README works without paying anyone. Sponsorship is **not a paywall**; it is direct support for the author so this project can keep moving forward.
+
+ASI Code 采用 **MIT 协议**，**所有 CLI 功能完全免费** —— README 里讲到的每一项都不需要付费就能用。赞助**不是解锁开关**，而是对作者的直接支持，让项目能持续推进。
+
+### What sponsorship actually unlocks / 赞助到底能换到什么
+
+Sponsorship tiers buy **services and influence**, not features:
+
+赞助换的是**服务和影响力**，不是功能本身：
+
+- **Recognition** — your name / handle / company logo on the README supporters list. 你的 ID 或公司 logo 会出现在 README 的赞助者列表里。
+- **Roadmap voice** — sponsor-tagged issues get prioritized; quarterly roadmap polls weight sponsor input higher. 带 sponsor 标签的 issue 优先处理，季度 roadmap 投票时赞助者权重更高。
+- **Early access** — large in-progress features (MCP integration, semantic index, vision loop) land on a sponsor branch first, weeks before they hit `main`. 重大功能（MCP、语义索引、视觉闭环）会先在 sponsor 分支上发布，比 main 早几周。
+- **Direct contact** — private Discord / WeChat group with the author for Q&A, debugging help, and architecture discussions. 私域 Discord/微信群里和作者直接交流，可以问问题、要 debug 帮助、聊架构。
+- **Company tier extras** — 30-min 1:1 video consult per month, README logo placement, dedicated roadmap slot. 公司档外加每月 30 分钟 1v1 视频咨询、README 公司 logo 位、专属 roadmap 名额。
+
+### Sponsor channels / 赞助渠道
+
+- **爱发电 (Mainland China, RMB)**: [afdian.com/a/AloneMath](https://afdian.com/a/AloneMath) — three tiers ¥5 / ¥30 / ¥199 per month.
+- **GitHub Sponsors**: the repo's ♥ Sponsor button redirects to the same 爱发电 page (China-mainland Stripe access is blocked, so direct bank-account payout via GitHub Sponsors is not currently available).
+
+For one-off support or enterprise contracts that don't fit the monthly tiers, reach out via the email listed on the GitHub profile.
+
+如果月度方案不合适——比如一次性赞助、企业合作、定制开发——可以通过 GitHub 主页邮箱直接联系。
 
 ## CLI x API Collaboration (ZH)
 

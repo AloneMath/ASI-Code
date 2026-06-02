@@ -450,7 +450,7 @@ impl Ui {
             self.dim("------------------------------------------------------------"),
             "1  function greet() {".to_string(),
             self.diff_removed("2  - console.log(\"Hello, World!\");"),
-            self.diff_added("2  + console.log(\"Hello, Claude!\");"),
+            self.diff_added("2  + console.log(\"Hello, ASI Code!\");"),
             "3  }".to_string(),
             self.dim("------------------------------------------------------------"),
         ]
