@@ -1426,7 +1426,7 @@ If you find this project useful and want to support continued development, spons
 ### How to sponsor
 
 - **爱发电**: [afdian.com/a/AloneMath](https://afdian.com/a/AloneMath) — ¥30 / month.
-- The repo's GitHub **♥ Sponsor** button redirects to the same 爱发电 page (China-mainland Stripe access is currently blocked, so direct bank-account payout via GitHub Sponsors is not available).
+- The repo's GitHub **♥ Sponsor** button redirects to the same 爱发电 page.
 
 ## CLI x API Collaboration (ZH)
 
