@@ -34,6 +34,25 @@ pub struct SessionMeta {
     pub agent_enabled: bool,
     pub auto_loop_stop_reason: Option<String>,
     pub confidence_gate: ConfidenceGateSessionStats,
+    #[serde(default)]
+    pub in_loop_state: Option<InLoopState>,
+}
+
+/// Snapshot of an in-flight auto-tool-loop. Saved alongside the runtime
+/// messages so that if the process crashes mid-loop, the next session
+/// can detect `loop_running=true` and offer to resume from where the
+/// loop left off without re-spending tokens on completed iterations.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InLoopState {
+    pub original_task_input: String,
+    pub iterations_done: usize,
+    pub changed_files: Vec<String>,
+    pub change_events: Vec<String>,
+    /// `true` while the loop is mid-flight; flipped to `false` when the
+    /// loop reaches any terminal state (completed, stopped, errored).
+    pub loop_running: bool,
+    pub started_at_ms: u128,
+    pub last_iteration_at_ms: u128,
 }
 
 #[derive(Clone)]
@@ -338,6 +357,7 @@ mod tests {
                 blocked_risky_toolcalls: 2,
                 retries_exhausted: 0,
             },
+            in_loop_state: None,
         };
 
         store
@@ -350,6 +370,82 @@ mod tests {
         assert_eq!(got.confidence_gate.checks, 3);
         assert_eq!(got.confidence_gate.blocked_risky_toolcalls, 2);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn in_loop_state_roundtrips_through_checkpoint() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("asi_session_store_in_loop_{}", ts));
+        fs::create_dir_all(&root).unwrap();
+        let store = SessionStore { root: root.clone() };
+        let msgs = vec![json!({"role": "user", "content": "fix bug"})];
+        let in_loop = InLoopState {
+            original_task_input: "fix the parser bug".to_string(),
+            iterations_done: 47,
+            changed_files: vec!["src/parser.rs".to_string(), "src/lexer.rs".to_string()],
+            change_events: vec!["edit_file:src/parser.rs".to_string()],
+            loop_running: true,
+            started_at_ms: 1_700_000_000_000,
+            last_iteration_at_ms: 1_700_000_100_000,
+        };
+        let meta = SessionMeta {
+            source: "in_loop_journal".to_string(),
+            agent_enabled: true,
+            auto_loop_stop_reason: None,
+            confidence_gate: ConfidenceGateSessionStats::default(),
+            in_loop_state: Some(in_loop.clone()),
+        };
+        store
+            .save_checkpoint_with_meta("deepseek", "deepseek-v4-pro", msgs, Some(meta))
+            .unwrap();
+        let loaded = store.load_checkpoint().unwrap();
+        let got = loaded.meta.unwrap().in_loop_state.unwrap();
+        assert_eq!(got.original_task_input, in_loop.original_task_input);
+        assert_eq!(got.iterations_done, in_loop.iterations_done);
+        assert_eq!(got.changed_files, in_loop.changed_files);
+        assert!(got.loop_running);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_session_meta_without_in_loop_state_loads() {
+        // Older binaries wrote SessionMeta without the new
+        // in_loop_state field. The #[serde(default)] attribute must
+        // keep deserialization working — None should be returned.
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("asi_session_legacy_in_loop_{}", ts));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("_checkpoint_latest.json");
+        let body = r#"{
+  "session_id": "checkpoint-1",
+  "provider": "openai",
+  "model": "gpt-4.1-mini",
+  "messages": [],
+  "meta": {
+    "source": "manual",
+    "agent_enabled": true,
+    "auto_loop_stop_reason": null,
+    "confidence_gate": {
+      "checks": 0,
+      "missing_declaration": 0,
+      "low_declaration": 0,
+      "blocked_risky_toolcalls": 0,
+      "retries_exhausted": 0
+    }
+  }
+}"#;
+        fs::write(&path, body).unwrap();
+        let store = SessionStore { root: root.clone() };
+        let loaded = store.load_checkpoint().unwrap();
+        let meta = loaded.meta.unwrap();
+        assert!(meta.in_loop_state.is_none());
         let _ = fs::remove_dir_all(root);
     }
 

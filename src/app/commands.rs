@@ -585,6 +585,7 @@ pub(crate) fn dispatch(command: crate::Command) -> Result<(), String> {
                     blocked_risky_toolcalls: confidence_gate_stats.blocked_risky_toolcalls(),
                     retries_exhausted: confidence_gate_stats.retries_exhausted(),
                 },
+                in_loop_state: None,
             };
             let session_id = match store.save_with_meta(
                 &cfg.provider,

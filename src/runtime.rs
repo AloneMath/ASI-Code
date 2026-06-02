@@ -2128,6 +2128,42 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
         }
     }
 
+    /// Turn-count threshold check: returns Some(reason) when the live
+    /// `turn_count()` has reached `ratio * max_turns`. Use this to
+    /// auto-compact BEFORE the runtime hits max_turns_reached so the
+    /// next user input doesn't fail immediately. `ratio` is clamped
+    /// to (0.0, 1.0]; values outside that range disable the check.
+    pub fn auto_compact_recommendation_by_turns(&self, ratio: f64) -> Option<String> {
+        if self.max_turns == 0 || !(ratio > 0.0 && ratio <= 1.0) {
+            return None;
+        }
+        let threshold = ((self.max_turns as f64) * ratio).ceil() as usize;
+        let threshold = threshold.max(1);
+        let turns = self.turn_count();
+        if turns >= threshold {
+            Some(format!(
+                "turns {} >= {} ({}% of max_turns {})",
+                turns,
+                threshold,
+                (ratio * 100.0).round() as usize,
+                self.max_turns
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Append a synthetic user-role message to history. Used by the
+    /// auto-tool-loop to inject auto-test failure feedback so the next
+    /// model turn sees it in context. Does not touch token counters —
+    /// those are updated on the next `run_turn_streaming` call.
+    pub fn push_user_message(&mut self, content: &str) {
+        self.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: content.to_string(),
+        });
+    }
+
     pub fn clear(&mut self) {
         self.messages = vec![ChatMessage {
             role: "system".to_string(),
@@ -4441,6 +4477,44 @@ mod tests {
         assert!(line.contains("native=false"));
         assert!(line.contains("supported=false"));
         assert!(line.contains("recommended_max_output_tokens=4096"));
+    }
+
+    #[test]
+    fn auto_compact_recommendation_by_turns_fires_above_ratio() {
+        let mut rt = Runtime::new(
+            "deepseek".to_string(),
+            "deepseek-v4-pro".to_string(),
+            "workspace-write".to_string(),
+            10,
+        );
+        for i in 0..8usize {
+            rt.messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: format!("msg {}", i),
+            });
+        }
+        // 8 user turns of 10 = 80%, threshold at 0.80 -> ceil(8.0) = 8 -> fires
+        assert!(rt.auto_compact_recommendation_by_turns(0.80).is_some());
+        // ratio 0.95 -> threshold ceil(9.5)=10, 8 < 10 -> no fire
+        assert!(rt.auto_compact_recommendation_by_turns(0.95).is_none());
+        // ratio 0 / >1 -> disabled
+        assert!(rt.auto_compact_recommendation_by_turns(0.0).is_none());
+        assert!(rt.auto_compact_recommendation_by_turns(1.5).is_none());
+    }
+
+    #[test]
+    fn auto_compact_recommendation_by_turns_disabled_when_max_turns_zero() {
+        let mut rt = Runtime::new(
+            "deepseek".to_string(),
+            "deepseek-v4-pro".to_string(),
+            "workspace-write".to_string(),
+            0,
+        );
+        rt.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: "x".to_string(),
+        });
+        assert!(rt.auto_compact_recommendation_by_turns(0.5).is_none());
     }
 
     #[test]

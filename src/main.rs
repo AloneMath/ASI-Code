@@ -1853,14 +1853,90 @@ fn run_repl(
 
     let store = SessionStore::default()?;
 
-    loop {
-        print!("{}", ui.input_prompt());
-        io::stdout().flush().map_err(|e| e.to_string())?;
+    // Auto-resume detection: if the prior session crashed mid-loop,
+    // `_checkpoint_latest.json` will have `meta.in_loop_state.loop_running = true`.
+    // Prompt the user to resume so the in-flight task continues from
+    // the last checkpointed iteration without re-spending tokens.
+    let mut pending_resume_task: Option<String> = None;
+    if auto_journal_enabled_via_env() && store.checkpoint_exists() {
+        if let Ok(saved) = store.load_checkpoint() {
+            if let Some(meta) = saved.meta.as_ref() {
+                if let Some(in_loop) = meta.in_loop_state.as_ref() {
+                    if in_loop.loop_running && !in_loop.original_task_input.trim().is_empty() {
+                        let age_minutes = {
+                            let last = in_loop.last_iteration_at_ms as i128;
+                            let now = now_unix_millis() as i128;
+                            ((now - last).max(0) / 60_000) as u64
+                        };
+                        let preview = clip_chars(in_loop.original_task_input.trim(), 80);
+                        println!(
+                            "{}",
+                            ui.info(&format!(
+                                "interrupted auto-loop detected: iterations={} last_activity={}m ago task=\"{}\"",
+                                in_loop.iterations_done, age_minutes, preview
+                            ))
+                        );
+                        print!("Resume? [Y/n] ");
+                        io::stdout().flush().map_err(|e| e.to_string())?;
+                        let mut answer = String::new();
+                        io::stdin()
+                            .read_line(&mut answer)
+                            .map_err(|e| e.to_string())?;
+                        let ans = answer.trim().to_ascii_lowercase();
+                        if ans.is_empty() || ans == "y" || ans == "yes" {
+                            rt.load_session_messages(
+                                saved.provider.clone(),
+                                saved.model.clone(),
+                                saved.messages.clone(),
+                            );
+                            cfg.provider = saved.provider.clone();
+                            cfg.model = saved.model.clone();
+                            apply_runtime_flags_from_cfg(&mut rt, &cfg);
+                            for path in &in_loop.changed_files {
+                                push_unique_changed_file(&mut changed_files_session, path);
+                            }
+                            change_events_session.extend(in_loop.change_events.iter().cloned());
+                            println!(
+                                "{}",
+                                ui.info(&format!(
+                                    "resumed checkpoint provider={} model={} messages={} changed_files={}",
+                                    cfg.provider,
+                                    cfg.model,
+                                    saved.messages.len(),
+                                    in_loop.changed_files.len()
+                                ))
+                            );
+                            pending_resume_task = Some(format!(
+                                "[resume] You are continuing a previous auto-tool-loop ({} prior iterations are already in conversation history). Continue from where you left off without redoing completed work.\n\nOriginal task: {}",
+                                in_loop.iterations_done, in_loop.original_task_input
+                            ));
+                        } else {
+                            println!("{}", ui.info("skipped resume; checkpoint kept on disk"));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-        let mut raw_line = String::new();
-        let n = io::stdin()
-            .read_line(&mut raw_line)
-            .map_err(|e| e.to_string())?;
+    loop {
+        let (raw_line, n) = if let Some(task) = pending_resume_task.take() {
+            // First iteration after accepted resume: synthesize a user
+            // turn from the saved original task. The REPL handles it
+            // identically to a typed line.
+            let mut buf = task;
+            buf.push('\n');
+            let len = buf.len();
+            (buf, len)
+        } else {
+            print!("{}", ui.input_prompt());
+            io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut raw_line = String::new();
+            let n = io::stdin()
+                .read_line(&mut raw_line)
+                .map_err(|e| e.to_string())?;
+            (raw_line, n)
+        };
 
         if n == 0 {
             break;
@@ -3558,6 +3634,7 @@ fn run_repl(
                     blocked_risky_toolcalls: confidence_gate_stats.blocked_risky_toolcalls(),
                     retries_exhausted: confidence_gate_stats.retries_exhausted(),
                 },
+                in_loop_state: None,
             };
             let path = store.save_with_meta(
                 &rt.provider,
@@ -3593,6 +3670,7 @@ fn run_repl(
                         blocked_risky_toolcalls: confidence_gate_stats.blocked_risky_toolcalls(),
                         retries_exhausted: confidence_gate_stats.retries_exhausted(),
                     },
+                    in_loop_state: None,
                 };
                 match store.save_checkpoint_with_meta(
                     &rt.provider,
@@ -3648,6 +3726,67 @@ fn run_repl(
                     Ok(()) => println!("{}", ui.info("checkpoint_cleared=true")),
                     Err(e) => println!("{}", ui.error(&format!("checkpoint_clear_failed: {}", e))),
                 }
+            } else if arg == "resume" {
+                match store.load_checkpoint() {
+                    Ok(saved) => {
+                        let in_loop = saved
+                            .meta
+                            .as_ref()
+                            .and_then(|m| m.in_loop_state.as_ref())
+                            .cloned();
+                        match in_loop {
+                            Some(state) if state.loop_running && !state.original_task_input.trim().is_empty() => {
+                                rt.load_session_messages(
+                                    saved.provider.clone(),
+                                    saved.model.clone(),
+                                    saved.messages.clone(),
+                                );
+                                cfg.provider = saved.provider.clone();
+                                cfg.model = saved.model.clone();
+                                apply_runtime_flags_from_cfg(&mut rt, &cfg);
+                                for path in &state.changed_files {
+                                    push_unique_changed_file(&mut changed_files_session, path);
+                                }
+                                change_events_session.extend(state.change_events.iter().cloned());
+                                pending_resume_task = Some(format!(
+                                    "[resume] You are continuing a previous auto-tool-loop ({} prior iterations are already in conversation history). Continue from where you left off without redoing completed work.\n\nOriginal task: {}",
+                                    state.iterations_done, state.original_task_input
+                                ));
+                                println!(
+                                    "{}",
+                                    ui.info(&format!(
+                                        "checkpoint_resumed provider={} model={} messages={} iterations={} task=\"{}\"",
+                                        cfg.provider,
+                                        cfg.model,
+                                        saved.messages.len(),
+                                        state.iterations_done,
+                                        clip_chars(state.original_task_input.trim(), 80)
+                                    ))
+                                );
+                            }
+                            Some(_) => {
+                                println!(
+                                    "{}",
+                                    ui.info(
+                                        "checkpoint has no in-flight loop to resume (loop_running=false)"
+                                    )
+                                );
+                            }
+                            None => {
+                                println!(
+                                    "{}",
+                                    ui.info(
+                                        "checkpoint has no in-loop state; use /checkpoint load to restore messages only"
+                                    )
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => println!(
+                        "{}",
+                        ui.error(&format!("checkpoint_load_failed: {}", e))
+                    ),
+                }
             } else if let Some(flag) = parse_on_off(arg) {
                 auto_checkpoint_enabled = flag;
                 println!(
@@ -3657,7 +3796,7 @@ fn run_repl(
             } else {
                 println!(
                     "{}",
-                    ui.error("Usage: /checkpoint [status|on|off|save|load|clear]")
+                    ui.error("Usage: /checkpoint [status|on|off|save|load|resume|clear]")
                 );
             }
             continue;
@@ -4253,6 +4392,34 @@ fn run_repl(
         }
 
         let is_tool_call = model_input.starts_with("/toolcall ");
+
+        // Pre-turn auto-compact guard: if we're about to hit max_turns or
+        // the cumulative-token threshold, compact first so this turn can
+        // actually run instead of returning "Max turns reached".
+        if !is_tool_call {
+            let token_threshold: usize = std::env::var("ASI_AUTO_COMPACT_INPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(120_000);
+            let turn_ratio: f64 = std::env::var("ASI_AUTO_COMPACT_TURN_RATIO")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.80);
+            let token_rec = rt.auto_compact_recommendation(token_threshold);
+            let turn_rec = rt.auto_compact_recommendation_by_turns(turn_ratio);
+            if let Some(reason) = token_rec.or(turn_rec) {
+                println!(
+                    "{}",
+                    ui.info(&format!(
+                        "auto-compacting context before turn ({}). Summarizing then continuing.",
+                        reason
+                    ))
+                );
+                let msg = rt.compact_with_summary(8);
+                println!("{}", ui.info(&msg));
+            }
+        }
+
         let start = Instant::now();
         let mut streamed = false;
         let mut stream_tokens = 0usize;
@@ -4516,6 +4683,22 @@ fn run_repl(
                 println!("{}", ui.tool_panel("auto_validate", status, &body));
             }
         }
+        // Optional auto-test guard (opt-in via ASI_AUTO_TEST=1). Catches
+        // the case where auto-loop was off or the user used a direct
+        // /toolcall write_file. Inside the auto-loop the loop body has
+        // its own self-heal hook that injects failure feedback.
+        let auto_test_results = run_auto_test_guards(&changed_this_turn);
+        if !auto_test_results.is_empty() {
+            println!(
+                "{}",
+                ui.info(&format_auto_test_summary(&auto_test_results))
+            );
+            for tr in &auto_test_results {
+                let status = if tr.ok { "ok" } else { "error" };
+                let body = format!("command: {}\n{}", tr.command, tr.output);
+                println!("{}", ui.tool_panel("auto_test", status, &body));
+            }
+        }
         if auto_checkpoint_enabled {
             let meta = session::SessionMeta {
                 source: "repl_auto_checkpoint".to_string(),
@@ -4528,6 +4711,7 @@ fn run_repl(
                     blocked_risky_toolcalls: confidence_gate_stats.blocked_risky_toolcalls(),
                     retries_exhausted: confidence_gate_stats.retries_exhausted(),
                 },
+                in_loop_state: None,
             };
             if let Err(e) = store.save_checkpoint_with_meta(
                 &rt.provider,
@@ -4603,6 +4787,7 @@ fn run_repl(
             blocked_risky_toolcalls: confidence_gate_stats.blocked_risky_toolcalls(),
             retries_exhausted: confidence_gate_stats.retries_exhausted(),
         },
+        in_loop_state: None,
     };
     let saved_path = match store.save_with_meta(
         &rt.provider,
@@ -14467,6 +14652,231 @@ fn format_auto_validation_summary(results: &[AutoValidationResult]) -> String {
         total, passed, failed
     )
 }
+
+/// Pure language classification of changed file paths — no filesystem
+/// access, so it is trivially testable. Returns (rust_touched, py_touched,
+/// node_touched). Used by `build_auto_test_commands` together with
+/// project-marker file probes to decide which test command to emit.
+pub(crate) fn classify_changed_files(changed_files: &[String]) -> (bool, bool, bool) {
+    let mut rust = false;
+    let mut py = false;
+    let mut node = false;
+    for path in changed_files {
+        let lower = path.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        if lower.ends_with(".rs")
+            || lower.ends_with("cargo.toml")
+            || lower.ends_with("cargo.lock")
+        {
+            rust = true;
+        }
+        if lower.ends_with(".py") {
+            py = true;
+        }
+        if lower.ends_with(".ts")
+            || lower.ends_with(".tsx")
+            || lower.ends_with(".js")
+            || lower.ends_with(".jsx")
+            || lower.ends_with(".mjs")
+            || lower.ends_with(".cjs")
+        {
+            node = true;
+        }
+    }
+    (rust, py, node)
+}
+
+fn pyproject_has_pytest_section() -> bool {
+    fs::read_to_string("pyproject.toml")
+        .map(|s| s.contains("[tool.pytest"))
+        .unwrap_or(false)
+}
+
+fn setup_cfg_has_pytest_section() -> bool {
+    fs::read_to_string("setup.cfg")
+        .map(|s| s.contains("[tool:pytest]"))
+        .unwrap_or(false)
+}
+
+fn package_json_has_test_script() -> bool {
+    let raw = match fs::read_to_string("package.json") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    value
+        .get("scripts")
+        .and_then(|s| s.get("test"))
+        .and_then(|t| t.as_str())
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Build the list of full-suite test commands to run after edits.
+/// Returns empty when the feature is disabled, when no relevant files
+/// changed, or when project markers do not match. v1 always emits the
+/// full-suite command for each language (no per-package scoping).
+pub(crate) fn build_auto_test_commands(changed_files: &[String]) -> Vec<String> {
+    if !auto_test_enabled_via_env() {
+        return Vec::new();
+    }
+    if changed_files.is_empty() {
+        return Vec::new();
+    }
+    let (rust, py, node) = classify_changed_files(changed_files);
+    let mut commands = Vec::new();
+    if rust && Path::new("Cargo.toml").exists() {
+        commands.push("cargo test --offline --quiet --no-fail-fast".to_string());
+    }
+    if py
+        && (Path::new("pytest.ini").exists()
+            || pyproject_has_pytest_section()
+            || setup_cfg_has_pytest_section())
+    {
+        commands.push("pytest -q --no-header".to_string());
+    }
+    if node && Path::new("package.json").exists() && package_json_has_test_script() {
+        commands.push("npm test --silent".to_string());
+    }
+    commands
+}
+
+/// Run the auto-test commands for this turn's edits. Output is clipped
+/// to 6000 chars per command — enough room for a real cargo/pytest
+/// failure trace, more than the auto-validation clip of 2400.
+pub(crate) fn run_auto_test_guards(changed_files: &[String]) -> Vec<AutoValidationResult> {
+    let commands = build_auto_test_commands(changed_files);
+    let mut results = Vec::new();
+    for command in commands {
+        let run = tools::run_tool("bash", &command);
+        let mut output = run.output.trim().to_string();
+        if output.is_empty() {
+            output = if run.ok {
+                "ok".to_string()
+            } else {
+                "failed (no output)".to_string()
+            };
+        }
+        results.push(AutoValidationResult {
+            command,
+            ok: run.ok,
+            output: clip_chars(&output, 6000),
+        });
+    }
+    results
+}
+
+fn format_auto_test_summary(results: &[AutoValidationResult]) -> String {
+    let passed = results.iter().filter(|x| x.ok).count();
+    let total = results.len();
+    let failed = total.saturating_sub(passed);
+    format!("auto_test={} passed={} failed={}", total, passed, failed)
+}
+
+pub(crate) fn auto_test_enabled_via_env() -> bool {
+    std::env::var("ASI_AUTO_TEST")
+        .ok()
+        .as_deref()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+pub(crate) fn auto_test_max_attempts_from_env() -> usize {
+    std::env::var("ASI_AUTO_TEST_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .max(1)
+}
+
+/// Auto-journal is the in-loop checkpoint that saves runtime state
+/// after every auto-tool-loop iteration (throttled). On crash/disconnect
+/// the user can resume from the last completed iteration without
+/// re-spending tokens on prior work. Default ON; set to 0 / off to skip.
+pub(crate) fn auto_journal_enabled_via_env() -> bool {
+    std::env::var("ASI_AUTO_JOURNAL")
+        .ok()
+        .as_deref()
+        .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(true)
+}
+
+pub(crate) fn auto_journal_interval_secs() -> u64 {
+    std::env::var("ASI_AUTO_JOURNAL_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+        .max(1)
+}
+
+fn now_unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Persist a journal snapshot of the in-flight auto-loop to the
+/// session-store's `_checkpoint_latest.json`. `loop_running=true` while
+/// the loop is mid-flight; flipped to `false` on any terminal branch so
+/// resume-on-startup ignores it.
+pub(crate) fn save_in_loop_journal(
+    rt: &runtime::Runtime,
+    original_task_input: &str,
+    iterations_done: usize,
+    changed_files: &[String],
+    change_events: &[String],
+    started_at_ms: u128,
+    loop_running: bool,
+    auto_loop_stop_reason: Option<String>,
+    confidence_gate_stats: &ConfidenceGateStats,
+) -> Result<(), String> {
+    let store = session::SessionStore::default()?;
+    let meta = session::SessionMeta {
+        source: "in_loop_journal".to_string(),
+        agent_enabled: true,
+        auto_loop_stop_reason,
+        confidence_gate: session::ConfidenceGateSessionStats {
+            checks: confidence_gate_stats.checks(),
+            missing_declaration: confidence_gate_stats.declaration_missing(),
+            low_declaration: confidence_gate_stats.declaration_low(),
+            blocked_risky_toolcalls: confidence_gate_stats.blocked_risky_toolcalls(),
+            retries_exhausted: confidence_gate_stats.retries_exhausted(),
+        },
+        in_loop_state: Some(session::InLoopState {
+            original_task_input: original_task_input.to_string(),
+            iterations_done,
+            changed_files: changed_files.to_vec(),
+            change_events: change_events.to_vec(),
+            loop_running,
+            started_at_ms,
+            last_iteration_at_ms: now_unix_millis(),
+        }),
+    };
+    store
+        .save_checkpoint_with_meta(&rt.provider, &rt.model, rt.as_json_messages(), Some(meta))
+        .map(|_| ())
+}
+
+pub(crate) fn build_auto_test_feedback_message(results: &[AutoValidationResult]) -> String {
+    let mut out = String::from(
+        "[auto_test:error] One or more tests failed after your last code change. Diagnose the root cause from the trace below and fix it. Do not skip or weaken tests.\n",
+    );
+    for r in results.iter().filter(|x| !x.ok) {
+        out.push_str("---\n");
+        out.push_str(&format!("command: {}\n", r.command));
+        out.push_str(&r.output);
+        if !r.output.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
 fn parse_change_event(ev: &str) -> (&str, &str) {
     match ev.split_once(':') {
         Some((src, path)) => (src, path),
@@ -17643,6 +18053,72 @@ mod prompt_and_validation_tests {
 
         if Path::new("Cargo.toml").exists() {
             assert!(cmds.iter().any(|c| c == "cargo check --offline"));
+        }
+    }
+
+    #[test]
+    fn classify_changed_files_buckets_rust_python_node() {
+        let (rust, py, node) = super::classify_changed_files(&[
+            "src/foo.rs".to_string(),
+            "Cargo.toml".to_string(),
+            "scripts/x.py".to_string(),
+            "web/app.tsx".to_string(),
+            "lib/m.mjs".to_string(),
+            "notes/readme.md".to_string(),
+        ]);
+        assert!(rust);
+        assert!(py);
+        assert!(node);
+    }
+
+    #[test]
+    fn classify_changed_files_ignores_unknown_extensions() {
+        let (rust, py, node) = super::classify_changed_files(&[
+            "notes/readme.md".to_string(),
+            "docs/spec.txt".to_string(),
+            "".to_string(),
+        ]);
+        assert!(!rust);
+        assert!(!py);
+        assert!(!node);
+    }
+
+    #[test]
+    fn auto_test_disabled_by_default_returns_empty() {
+        // Env var unset / not "1" should keep auto-test fully off.
+        let prev = std::env::var("ASI_AUTO_TEST").ok();
+        std::env::remove_var("ASI_AUTO_TEST");
+        let cmds = super::build_auto_test_commands(&["src/foo.rs".to_string()]);
+        assert!(cmds.is_empty(), "expected no commands when disabled: {:?}", cmds);
+        if let Some(v) = prev {
+            std::env::set_var("ASI_AUTO_TEST", v);
+        }
+    }
+
+    #[test]
+    fn auto_test_feedback_message_contains_failure_marker_and_trace() {
+        let results = vec![super::AutoValidationResult {
+            command: "cargo test --offline --quiet --no-fail-fast".to_string(),
+            ok: false,
+            output: "test failed: assertion left == right\n  left: 4\n  right: 5".to_string(),
+        }];
+        let msg = super::build_auto_test_feedback_message(&results);
+        assert!(msg.contains("[auto_test:error]"));
+        assert!(msg.contains("cargo test --offline"));
+        assert!(msg.contains("assertion left == right"));
+        assert!(msg.contains("Do not skip or weaken tests"));
+    }
+
+    #[test]
+    fn auto_test_max_attempts_clamped_at_least_one() {
+        let prev = std::env::var("ASI_AUTO_TEST_MAX_ATTEMPTS").ok();
+        std::env::set_var("ASI_AUTO_TEST_MAX_ATTEMPTS", "0");
+        assert_eq!(super::auto_test_max_attempts_from_env(), 1);
+        std::env::set_var("ASI_AUTO_TEST_MAX_ATTEMPTS", "5");
+        assert_eq!(super::auto_test_max_attempts_from_env(), 5);
+        match prev {
+            Some(v) => std::env::set_var("ASI_AUTO_TEST_MAX_ATTEMPTS", v),
+            None => std::env::remove_var("ASI_AUTO_TEST_MAX_ATTEMPTS"),
         }
     }
 

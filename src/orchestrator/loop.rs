@@ -517,16 +517,60 @@ fn run_tool_loop_core(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(120_000);
+    let auto_compact_turn_ratio: f64 = std::env::var("ASI_AUTO_COMPACT_TURN_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.80);
     let mut auto_compactions_done: usize = 0;
+
+    // Auto-test self-heal state (feature gated by ASI_AUTO_TEST=1).
+    // After each iteration that grew changed_files, we run the project's
+    // test command and — on failure — inject the trace as a synthetic
+    // user message so the model fixes the cause on the next iteration.
+    let auto_test_enabled = crate::auto_test_enabled_via_env();
+    let auto_test_max_attempts: usize = crate::auto_test_max_attempts_from_env();
+    let mut auto_test_attempts: usize = 0;
+    let mut changed_files_len_at_last_test: usize = changed_files.len();
+
+    // Auto-journal: persist a checkpoint of in-loop state after every
+    // iteration (throttled). On crash/disconnect the user can resume
+    // from this snapshot without re-spending tokens. Default ON.
+    let journal_enabled = crate::auto_journal_enabled_via_env();
+    let journal_interval = std::time::Duration::from_secs(crate::auto_journal_interval_secs());
+    let journal_started_at_ms = crate::now_unix_millis();
+    let mut journal_last_saved_at: Option<Instant> = None;
+    let mut journal_iterations_done: usize = 0;
+    // Save an initial journal entry on entry so a crash before the
+    // first iteration finishes still leaves a resumable snapshot.
+    if journal_enabled {
+        let _ = crate::save_in_loop_journal(
+            rt,
+            task_input,
+            journal_iterations_done,
+            changed_files,
+            change_events.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
+            journal_started_at_ms,
+            true,
+            None,
+            confidence_gate_stats,
+        );
+        journal_last_saved_at = Some(Instant::now());
+    }
 
     loop {
         // Auto-trigger smart compaction when the cumulative input-token
-        // budget is approaching the model's context cap. This is what
+        // budget OR live turn count is approaching its cap. This is what
         // makes overnight 8-hour-plus tasks possible without context
         // exhaustion — we summarize once we cross the threshold, then
         // continue with a fresh head + recent tail.
-        if auto_compact_threshold > 0 && auto_compactions_done < 8 {
-            if let Some(reason) = rt.auto_compact_recommendation(auto_compact_threshold) {
+        if auto_compactions_done < 8 {
+            let token_rec = if auto_compact_threshold > 0 {
+                rt.auto_compact_recommendation(auto_compact_threshold)
+            } else {
+                None
+            };
+            let turn_rec = rt.auto_compact_recommendation_by_turns(auto_compact_turn_ratio);
+            if let Some(reason) = token_rec.or(turn_rec) {
                 loop_info(
                     mode,
                     ui,
@@ -1292,9 +1336,97 @@ fn run_tool_loop_core(
         }
         current = next;
 
+        // Auto-journal: throttled per-iteration checkpoint.
+        journal_iterations_done += 1;
+        if journal_enabled {
+            let due = match journal_last_saved_at {
+                None => true,
+                Some(t) => t.elapsed() >= journal_interval,
+            };
+            if due {
+                let _ = crate::save_in_loop_journal(
+                    rt,
+                    task_input,
+                    journal_iterations_done,
+                    changed_files,
+                    change_events.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
+                    journal_started_at_ms,
+                    true,
+                    None,
+                    confidence_gate_stats,
+                );
+                journal_last_saved_at = Some(Instant::now());
+            }
+        }
+
+        // Auto-test self-heal: if the iteration grew changed_files,
+        // run the project's test command. On failure, inject a
+        // user-role feedback message so the next iteration sees it.
+        if auto_test_enabled
+            && auto_test_attempts < auto_test_max_attempts
+            && changed_files.len() > changed_files_len_at_last_test
+        {
+            let new_slice = changed_files[changed_files_len_at_last_test..].to_vec();
+            let results = crate::run_auto_test_guards(&new_slice);
+            changed_files_len_at_last_test = changed_files.len();
+            if !results.is_empty() {
+                loop_info(
+                    mode,
+                    ui,
+                    &format!(
+                        "auto_test={} passed={} failed={}",
+                        results.len(),
+                        results.iter().filter(|r| r.ok).count(),
+                        results.iter().filter(|r| !r.ok).count()
+                    ),
+                );
+                if let Some(panel) = ui {
+                    for tr in &results {
+                        let status = if tr.ok { "ok" } else { "error" };
+                        let body = format!("command: {}\n{}", tr.command, tr.output);
+                        println!("{}", panel.tool_panel("auto_test", status, &body));
+                    }
+                }
+                let any_failed = results.iter().any(|r| !r.ok);
+                if any_failed {
+                    let feedback = crate::build_auto_test_feedback_message(&results);
+                    rt.push_user_message(&feedback);
+                    auto_test_attempts += 1;
+                    if auto_test_attempts >= auto_test_max_attempts {
+                        loop_info(
+                            mode,
+                            ui,
+                            "auto-agent stopped: auto_test_max_attempts_reached",
+                        );
+                        loop_stop_reason =
+                            Some("auto_test_max_attempts_reached".to_string());
+                        break;
+                    }
+                }
+            }
+        }
+
         if !is_auto_loop_continuable_stop_reason(&current.stop_reason) {
             break;
         }
+    }
+
+    // Final journal save with loop_running=false so the next REPL
+    // launch's auto-resume detector skips this checkpoint (it would
+    // otherwise see a stale "still running" snapshot and prompt to
+    // resume a loop that already terminated normally).
+    if journal_enabled {
+        let _ = crate::save_in_loop_journal(
+            rt,
+            task_input,
+            journal_iterations_done,
+            changed_files,
+            change_events.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
+            journal_started_at_ms,
+            false,
+            loop_stop_reason.clone(),
+            confidence_gate_stats,
+        );
     }
 
     (current, extra_cost, steps, loop_stop_reason)

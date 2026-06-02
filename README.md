@@ -60,9 +60,12 @@ This project is independent and is not affiliated with, endorsed by, or sponsore
   - feature killswitches (`web_tools`, `bash_tool`, `subagent`, `research`)
   - explicit remote policy sync (`/policy sync`) with safe-mode guardrails
 - Theme setup flow:
-  - `theme` / `/theme` text style chooser with preview
+  - `theme` / `/theme` text style chooser with preview (7 themes: dark / light / colorblind variants / ANSI variants / cubist Picasso-inspired truecolor)
   - `setup` / `/setup` API key + model + wallet setup wizard
   - `scan` / `/scan` repository pattern scan panel (auto-detects project profile: Rust/JavaScript/Python when no patterns are provided, supports deep mode: `--deep` or `--deep=N`)
+- Context auto-compaction: triggers automatically before each turn when cumulative input tokens cross `ASI_AUTO_COMPACT_INPUT_TOKENS` (default `120000`) OR live turn count crosses `ASI_AUTO_COMPACT_TURN_RATIO * max_turns` (default `0.80`), so long sessions never silently dead-end on `max_turns_reached`
+- Test feedback loop (opt-in via `ASI_AUTO_TEST=1`): after every code-changing iteration the auto-tool-loop runs the project's test command (`cargo test` for Rust, `pytest` for Python with a pytest config marker, `npm test` for Node with a `scripts.test`) and on failure injects the trace as a synthetic user message so the model fixes the cause — capped at `ASI_AUTO_TEST_MAX_ATTEMPTS` consecutive self-heal rounds (default 3)
+- Auto-loop journal + resume (default ON, throttled to one save per `ASI_AUTO_JOURNAL_INTERVAL_SECS`, default 30s): every auto-tool-loop iteration writes a checkpoint with `messages` + `changed_files` + `change_events` + the original task input; if the prior session crashed mid-loop, REPL startup detects `loop_running=true` and prompts `Resume? [Y/n]`. Manual trigger: `/checkpoint resume`. Disable with `ASI_AUTO_JOURNAL=0`
 
 ## What's New in 2.0 (Preview)
 
@@ -153,13 +156,82 @@ The auto-loop's "no progress across too many rounds" circuit breaker previously 
 
 The detector now classifies each round as one of `FilesChanged` / `ReadOnlyToolSuccess` / `Nothing`, and only the third increments the no-progress counter. The tunable cap (`ASI_AUTO_AGENT_MAX_NO_PROGRESS_ROUNDS`, default 12) is unchanged; what changed is what counts.
 
+### Cubist theme — Picasso-inspired terminal UI
+
+A 7th `/theme` option, `cubist`, gives the REPL a high-contrast Picasso-style look that goes beyond ANSI 16-color palettes. It is opt-in — pick `7` in `/theme` and the existing six themes stay byte-identical.
+
+What changes when `theme=cubist` is active:
+
+- **Truecolor palette** — 24-bit ANSI (`\x1b[38;2;R;G;B`) cobalt / ochre / sage / terra cotta / slate / ivory replaces the basic 4-bit colors.
+- **Asymmetric welcome mosaic** — two side-by-side block-drawn panels with diagonal `╱╲` cuts and a deconstructed `◆ A ◇ S ◢ I ▲ ◆ C ◇ o ◢ d ▲ e ▽` letter banner instead of the rounded box.
+- **Geometric tool panel** — `◢◣ TOOL <name> (<status>) ◣◢` head with a `▰▱` block-fragment border, replacing the `─` line.
+- **Animated spinner** — a real tick-driven frame loop cycling through `◆ ◇ ▲ △ ▰ ▱` at 200 ms intervals (a thread is spawned only in cubist; other themes keep the static glyph).
+- **Deconstructed progress bar** — `◇ progress ▰▰▰▱▱▱▱▱▱▱ 3/10` rendered after each tool call in the auto-loop, parallel and sequential branches alike.
+- **Streaming `<toolcall>` interception** — when the model emits raw `<toolcall>…</toolcall>` (or `<tool_call>` / `<tool_calls>`) XML mid-stream, the line buffer suppresses it and emits a single `◢◣ INTENT ▸ <tool name>` panel instead of dumping the XML to the terminal.
+- **Hidden-content notice** — the read_file compact body becomes `◢ [read_file:… lines …] / ◇ content hidden ◇ use /toolcall read_file …` instead of the previous parenthetical.
+- **Diff highlighting in edit_file / write_file panels** — `+ ` / `- ` / `@@` / `[section]` lines inside the tool body are colored with the cubist diff palette (sage on dark for added, ivory on terra-cotta for removed).
+
+Pick the theme: `/theme` → `7`. Persisted in `AppConfig.theme`. Truecolor requires a modern terminal (Windows Terminal, VS Code terminal, iTerm2, mintty); legacy `conhost` falls back gracefully on the other six themes.
+
+### Auto-compact — never hit `max_turns_reached` again
+
+The runtime tracks both cumulative input tokens and live turn count. Earlier the only auto-trigger was a token threshold (`ASI_AUTO_COMPACT_INPUT_TOKENS`, default 120000) and it only fired *inside* the auto-tool-loop. A long auto-loop could rack up 200 turns at 40 K tokens, hit `max_turns_reached`, and then every subsequent REPL input would fail immediately because turn-count is the gate.
+
+Two changes close this gap:
+
+- **Turn-ratio trigger** — `Runtime::auto_compact_recommendation_by_turns(ratio)` returns `Some(reason)` when `turn_count() >= ceil(max_turns * ratio)`. The default ratio is **0.80** (so at `max_turns=200`, compaction fires at 160). Tune with `ASI_AUTO_COMPACT_TURN_RATIO=0.0` to disable, or any `(0.0, 1.0]` value.
+- **Pre-turn REPL guard** — before each `run_turn_streaming` call, the REPL checks both the token threshold and the turn ratio. If either fires, it runs `compact_with_summary(8)` first, prints the result, and proceeds. So even if you walked away from a session that hit `max_turns_reached`, the next prompt auto-compacts and continues normally instead of returning the error immediately.
+
+The auto-tool-loop also picks up the turn-ratio trigger alongside the existing token trigger, so long-running fan-outs (50+ tool calls) compact mid-run instead of waiting for either limit to land.
+
+### Test feedback loop — auto-run tests, auto-heal on failure
+
+Default-OFF, opt-in via `ASI_AUTO_TEST=1`. Once enabled, every iteration of the auto-tool-loop that touches code (`write_file` / `edit_file` / `/toolcall write_file …`) is followed by a real test run. The detector classifies the changed files by suffix and only fires the matching language's test command:
+
+| Language trigger | Marker required | Command emitted |
+|---|---|---|
+| `.rs` / `Cargo.toml` / `Cargo.lock` | `Cargo.toml` in CWD | `cargo test --offline --quiet --no-fail-fast` |
+| `.py` | `pytest.ini` OR `pyproject.toml` with `[tool.pytest…]` OR `setup.cfg` with `[tool:pytest]` | `pytest -q --no-header` |
+| `.ts` / `.tsx` / `.js` / `.jsx` / `.mjs` / `.cjs` | `package.json` with non-empty `scripts.test` | `npm test --silent` |
+
+On failure, the loop:
+
+1. Renders an `auto_test (error)` tool panel with the clipped (6000 char) trace.
+2. Pushes a synthetic user-role message `[auto_test:error] One or more tests failed after your last code change. Diagnose the root cause from the trace below and fix it. Do not skip or weaken tests.` followed by the command and trace into runtime history.
+3. Lets the next loop iteration run normally — the model now has the failure in context and produces a fix.
+
+Self-heal is capped by `ASI_AUTO_TEST_MAX_ATTEMPTS` (default **3**). After that many consecutive failures the loop exits with `stop_reason=auto_test_max_attempts_reached` instead of looping forever. Outside the auto-tool-loop (manual `/toolcall write_file` etc.) the same test command runs at the end of the turn for visibility, but no self-heal injection happens.
+
+Project-marker-aware: a Rust-only repo never runs `pytest`, a Python-only repo never runs `cargo test`. Multi-language repos run only the tests for languages whose source actually changed this turn. Pure docs / markdown edits never trigger tests.
+
+### Auto-loop journal + resume — survive crashes mid-task
+
+Long auto-tool-loops (hours of agent work) used to be all-or-nothing: a single crash, network blip, or laptop sleep mid-run discarded every prior tool call's spend. The journal layer turns the existing checkpoint into a per-iteration journal, so the next launch can resume from the last completed iteration with zero replay.
+
+Default ON; disable with `ASI_AUTO_JOURNAL=0`. What changes:
+
+- **Per-iteration save (throttled)**: inside `run_tool_loop_core`, after every iteration finishes, the runtime writes `messages` + `changed_files` + `change_events` + `original_task_input` + iteration counter into `sessions/_checkpoint_latest.json` under a new `meta.in_loop_state` block. Throttled to one save per `ASI_AUTO_JOURNAL_INTERVAL_SECS` (default `30`) so a fast loop doesn't hammer disk.
+- **`loop_running` flag**: every in-loop save marks `loop_running=true`. The final save on any terminal branch (completed, stopped, errored, `auto_test_max_attempts_reached`) flips it to `false`, so a cleanly-finished loop never triggers the resume prompt on the next launch.
+- **Startup auto-prompt**: when the REPL starts, if `_checkpoint_latest.json` has `loop_running=true` and a non-empty `original_task_input`, you see:
+  ```
+  INFO interrupted auto-loop detected: iterations=47 last_activity=12m ago task="fix the parser bug…"
+  Resume? [Y/n]
+  ```
+  Enter (or `y`) restores `rt.messages`, `changed_files`, `change_events`, and re-enters the auto-tool-loop with a `[resume]` banner so the model continues from where it left off. `n` keeps the checkpoint on disk for later.
+- **Manual resume**: `/checkpoint resume` does the same thing mid-session — useful if you dismissed the startup prompt and changed your mind, or want to abandon the current REPL state and pick up the prior interrupted loop.
+
+The journal piggybacks on the existing single-file checkpoint, so disk footprint stays bounded — each save overwrites the previous. v1 keeps only the latest snapshot; full history with named resumable points is a v2.
+
 ### Roadmap
 
 - **Tier 1 (shipped):** screen capture, window targeting, click, typing, on-screen OCR.
 - **Tier 2 (shipped):** UE5 / Blender / Unity bridges; Unity has live-editor C# drop.
 - **Tier 3 (shipped):** 3D-aware scene probes for UE5 / Blender / Unity, deterministic `probe_diff`, frame-folder `video_capture` + `video_keyframes` for temporal context.
-- **Tier 4 (next):** mobile and cross-device remote — a small relay so the CLI can be triggered from a phone or another machine.
-- **Tier 5 (deliberately not pursued in 2.0):** AGI-level autonomous creative work. The bridge layer is the leverage — when the underlying models get stronger, every existing bridge inherits the new capability automatically.
+- **Engineering reliability (shipped on `main`):** cubist Picasso theme, auto-compact (token + turn-ratio + pre-turn guard), test feedback loop (`cargo test` / `pytest` / `npm test` with self-heal), auto-loop journal + resume (per-iteration checkpoint + startup auto-resume prompt).
+- **Tier 4 (planned, ~1 week):** **MCP (Model Context Protocol) integration** — the existing tools list (`bash`, `read_file`, `edit_file`, `glob_search`, `grep_search`, computer-control, engine bridges, scene probes) is all hardcoded in Rust today. Adding a proper MCP client lets users plug in *any* MCP server — Jira, Confluence, GitHub Enterprise, Datadog, Snowflake, internal RAG, anything the community ships — without patching ASI Code source. This is the single largest leverage point for the B2B story: it converts a fixed tool set into an open ecosystem and is what every "agentic IDE" in the market is converging on. Listed as the next milestone after engineering-reliability work lands.
+- **Tier 5 (planned, ~2-3 weeks):** **Semantic codebase index** — full-suite test feedback only works when the model can actually navigate the repo. On a 50K-line project glob+grep is fine; on a 500K-line monorepo it returns hundreds of low-signal matches that burn context. The plan is an embeddings + AST index (call graph, type hierarchy, file synopsis cache extended to symbol-level) so queries like "find all callers of `PaymentService`" or "show me every place this type is consumed" return ranked results without scanning every file. This is the gating capability for true enterprise-scale work; Cursor / Claude Code both ship a version of it. Holds until Tier 4 lands because the MCP layer naturally hosts the index server.
+- **Tier 6 (next, then):** mobile and cross-device remote — a small relay so the CLI can be triggered from a phone or another machine.
+- **Tier 7 (deliberately not pursued in 2.0):** AGI-level autonomous creative work. The bridge layer is the leverage — when the underlying models get stronger, every existing bridge inherits the new capability automatically.
 
 ## Quick Start
 
@@ -701,6 +773,9 @@ asi plugin config set demo-plugin signature "sig:publisher-v1" --json
 - DeepSeek: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`
 - Claude: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`
 - ASI toggles: `ASI_TELEMETRY`, `ASI_UNDERCOVER`, `ASI_AUTO_CHECKPOINT`, `ASI_NATIVE_TOOL_CALLING`, `ASI_PROVIDER_MAX_RETRIES`, `ASI_PROVIDER_RETRY_BACKOFF_MS`, `ASI_MODEL_AUTO_FALLBACK`
+- Auto-compaction: `ASI_AUTO_COMPACT_INPUT_TOKENS` (default `120000`; `0` disables the token trigger), `ASI_AUTO_COMPACT_TURN_RATIO` (default `0.80`; values outside `(0.0, 1.0]` disable the turn trigger). Both are evaluated before each REPL turn AND inside the auto-tool-loop.
+- Test feedback loop (opt-in): `ASI_AUTO_TEST` (`1` / `true` / `on` to enable; default OFF), `ASI_AUTO_TEST_MAX_ATTEMPTS` (default `3`, clamped to `>=1`; caps consecutive self-heal attempts before the loop exits with `auto_test_max_attempts_reached`).
+- Auto-loop journal (default ON): `ASI_AUTO_JOURNAL` (`0` / `false` / `off` to disable), `ASI_AUTO_JOURNAL_INTERVAL_SECS` (default `30`, clamped to `>=1`; minimum seconds between per-iteration saves to bound disk writes).
 - Project instruction loading: `ASI_PROJECT_INSTRUCTIONS_LAYERED` (default `true`), `ASI_PROJECT_INSTRUCTIONS_MAX_LEVELS` (default `4`), `ASI_CLAUDE_SINGLE` (default `true`)
   - instruction candidates (high to low priority per directory):
     - Claude single mode: `CLAUDE.override.md`, `CLAUDE.local.md`, `CLAUDE.md`
