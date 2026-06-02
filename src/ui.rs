@@ -1,6 +1,6 @@
 use crate::cost;
 use crate::meta::{APP_NAME, APP_VERSION};
-1
+
 const CUBIST_COBALT: &str = "38;2;53;92;143";
 const CUBIST_OCHRE: &str = "38;2;199;127;61";
 const CUBIST_SAGE: &str = "38;2;122;143;92";
