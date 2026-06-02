@@ -1,4 +1,0 @@
-# China-mainland Stripe access is blocked, so direct GitHub Sponsors
-# bank-account payout is rejected. The `custom` field redirects the
-# GitHub "Sponsor" button straight to 爱发电 (afdian) instead.
-custom: ["https://afdian.com/a/AloneMath"]

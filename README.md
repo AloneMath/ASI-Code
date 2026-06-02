@@ -1,6 +1,5 @@
 ﻿# ASI Code
 
-[![Sponsor on 爱发电](https://img.shields.io/badge/%E7%88%B1%E5%8F%91%E7%94%B5-Sponsor-946ce6?style=flat-square)](https://afdian.com/a/AloneMath)
 [![GitHub Stars](https://img.shields.io/github/stars/AloneMath/ASI-Code?style=flat-square)](https://github.com/AloneMath/ASI-Code/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
@@ -1411,22 +1410,6 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE).
 - Positioning: keep individual developer productivity open; monetize team/enterprise governance and reliability.
 
 See: [GITHUB_REPO_COPY_BILINGUAL.md](GITHUB_REPO_COPY_BILINGUAL.md)
-
-## Support the Project
-
-ASI Code is **MIT-licensed** and the CLI is **fully free**. Every feature documented in this README works without paying anyone — sponsorship is not a paywall.
-
-If you find this project useful and want to support continued development, sponsorship is simply a thank-you channel for the author. You are not buying features; you are choosing to back the project.
-
-### What sponsors get
-
-- Your name or handle listed on the README supporters section.
-- A direct line for bug reports, feature requests, and feedback — the author reads everything from sponsors.
-
-### How to sponsor
-
-- **爱发电**: [afdian.com/a/AloneMath](https://afdian.com/a/AloneMath) — ¥30 / month.
-- The repo's GitHub **♥ Sponsor** button redirects to the same 爱发电 page.
 
 ## CLI x API Collaboration (ZH)
 
