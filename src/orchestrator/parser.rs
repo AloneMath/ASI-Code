@@ -18,7 +18,8 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
     let mut normalized_toolcall_lines: Vec<(String, usize)> = Vec::new();
     let mut previous_tool_end_line: Option<usize> = None;
 
-    let pseudo_xml_normalized = normalize_pseudo_xml_toolcall_markers(text);
+    let single_line_wrapper_normalized = normalize_single_line_toolcall_wrapper(text);
+    let pseudo_xml_normalized = normalize_pseudo_xml_toolcall_markers(&single_line_wrapper_normalized);
     let cjk_bracket_normalized = normalize_cjk_bracket_call_markers(&pseudo_xml_normalized);
     let inline_calling_normalized = normalize_inline_angle_calling_blocks(&cjk_bracket_normalized);
     let calling_normalized = normalize_calling_markdown_blocks(&inline_calling_normalized);
@@ -174,6 +175,69 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
 ///     read_file "hello.py" 1 50
 ///     < /toolcall >
 ///
+/// Recognize the single-line wrapper shape some DeepSeek models emit where
+/// the open tag, the bare tool invocation, and the close tag are all glued
+/// onto one line instead of split across separate lines:
+///
+///     <toolcall>read_file buggy_calc.py 1 240</toolcall>
+///     <tool_call>bash pytest -q</tool_call>
+///
+/// Every other normalizer in this module assumes `<toolcall>`/`</toolcall>`
+/// markers sit alone on their own line, with the payload on subsequent
+/// lines. That assumption misses this single-line shape entirely: the line
+/// never matches `/toolcall `, so the whole response is silently parsed as
+/// zero tool calls. Left unhandled, the auto-loop treats a response like
+/// this as "no actions needed" and stops after a single turn even though
+/// the model clearly intended to run a tool.
+///
+/// We only rewrite when the inner content starts with a known tool name
+/// (after normalizing aliases), so we don't accidentally rewrite prose that
+/// happens to be wrapped in unrelated `<toolcall>...</toolcall>`-shaped
+/// tags.
+fn normalize_single_line_toolcall_wrapper(text: &str) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        if let Some(rewritten) = try_rewrite_single_line_toolcall_wrapper(line.trim()) {
+            out.push(rewritten);
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out.join("\n")
+}
+
+fn try_rewrite_single_line_toolcall_wrapper(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let (open, close) = if lower.starts_with("<toolcall>") {
+        ("<toolcall>", "</toolcall>")
+    } else if lower.starts_with("<tool_call>") {
+        ("<tool_call>", "</tool_call>")
+    } else {
+        return None;
+    };
+    if !lower.ends_with(close) || line.len() < open.len() + close.len() {
+        return None;
+    }
+
+    let inner = line[open.len()..line.len() - close.len()].trim();
+    if inner.is_empty() || inner.starts_with('<') {
+        return None;
+    }
+
+    let first_token = inner.split_whitespace().next()?;
+    let normalized_name = normalize_tag_tool_name(&first_token.to_ascii_lowercase());
+    if !is_known_tool_name(&normalized_name) {
+        return None;
+    }
+
+    let rest = inner[first_token.len()..].trim_start();
+    if rest.is_empty() {
+        Some(format!("/toolcall {}", normalized_name))
+    } else {
+        Some(format!("/toolcall {} {}", normalized_name, rest))
+    }
+}
+
 /// Markers with a space-before-slash (`< /toolcall >`) are unambiguously
 /// pseudo-XML separators and are always dropped. No-space markers
 /// (`<toolcall>` / `</toolcall>`) may also be real wrapper open/close
@@ -2946,6 +3010,46 @@ mod tests {
         let call = parse_toolcall_line("/toolcall glob_search(\"src/**/*.ts\")").unwrap();
         assert_eq!(call.name, "glob_search");
         assert_eq!(call.args, "src/**/*.ts");
+    }
+
+    #[test]
+    fn extracts_single_line_toolcall_wrapper() {
+        // DeepSeek's observed shape: open tag, bare tool call, and close tag
+        // all on one line, with no surrounding /toolcall marker.
+        let text = "<toolcall>read_file buggy_calc.py 1 240</toolcall>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].args, "buggy_calc.py 1 240");
+    }
+
+    #[test]
+    fn extracts_single_line_tool_call_underscore_wrapper() {
+        let text = "<tool_call>bash pytest -q</tool_call>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].args, "pytest -q");
+    }
+
+    #[test]
+    fn extracts_multiple_single_line_toolcall_wrappers() {
+        let text = "<toolcall>read_file buggy_calc.py 1 240</toolcall>\n<toolcall>read_file test_buggy_calc.py 1 240</toolcall>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].args, "buggy_calc.py 1 240");
+        assert_eq!(calls[1].name, "read_file");
+        assert_eq!(calls[1].args, "test_buggy_calc.py 1 240");
+    }
+
+    #[test]
+    fn ignores_single_line_wrapper_with_unknown_tool_name() {
+        // Prose that happens to look like a wrapper but doesn't start with
+        // a known tool name must not be rewritten.
+        let text = "<toolcall>not a real tool invocation</toolcall>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 0);
     }
 
     #[test]
