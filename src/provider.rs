@@ -11,6 +11,79 @@ use std::io::{BufRead, BufReader};
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Native tool calls attached to an assistant message, stored in the
+    /// OpenAI wire shape so history replays the exact protocol the model
+    /// was trained on. Empty for plain text messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallSpec>,
+    /// For role="tool" messages: the id of the assistant tool call this
+    /// result answers. None for all other roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallSpec>,
+    ) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+/// A tool call in the OpenAI wire shape, as stored in conversation history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallSpec {
+    pub id: String,
+    #[serde(rename = "type", default = "default_tool_call_type")]
+    pub call_type: String,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+fn default_tool_call_type() -> String {
+    "function".to_string()
+}
+
+impl ToolCallSpec {
+    pub fn from_call(call: &ToolCall) -> Self {
+        Self {
+            id: call.id.clone(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+        }
+    }
 }
 
 /// Result from a text streaming request.
@@ -961,11 +1034,35 @@ impl ProviderClient {
         let key = env::var(key_env).map_err(|_| format!("Missing {}", key_env))?;
         let base = env::var(url_env).unwrap_or_else(|_| default_url.to_string());
 
-        // Build messages array including tool results
-        let mut api_messages: Vec<Value> = messages
-            .iter()
-            .map(|m| json!({"role": m.role, "content": m.content}))
-            .collect();
+        // Build messages array, replaying native tool-calling protocol from
+        // history: assistant messages keep their tool_calls array, and tool
+        // results go out as role="tool" with the matching tool_call_id. This
+        // is the exact shape tool-trained models expect; flattening it into
+        // user text (the old behavior) pushed models off-distribution and
+        // caused erratic mid-task stops.
+        let mut api_messages: Vec<Value> = Vec::with_capacity(messages.len());
+        for m in messages {
+            if m.role == "assistant" && !m.tool_calls.is_empty() {
+                let content_value = if m.content.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(m.content.clone())
+                };
+                api_messages.push(json!({
+                    "role": "assistant",
+                    "content": content_value,
+                    "tool_calls": m.tool_calls
+                }));
+            } else if m.role == "tool" {
+                api_messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.content
+                }));
+            } else {
+                api_messages.push(json!({"role": m.role, "content": m.content}));
+            }
+        }
 
         for (call_id, result_text) in tool_results {
             api_messages.push(json!({
@@ -1112,6 +1209,15 @@ impl ProviderClient {
         for idx in indices {
             if let Some((id, name, arguments)) = tc_index_map.remove(&idx) {
                 if !name.is_empty() {
+                    // Some OpenAI-compatible gateways omit tool call ids in the
+                    // stream. History replay needs a stable id to pair the
+                    // assistant tool_calls entry with its role="tool" result,
+                    // so synthesize one when missing.
+                    let id = if id.is_empty() {
+                        format!("call_auto_{}", idx)
+                    } else {
+                        id
+                    };
                     tool_calls.push(ToolCall {
                         id,
                         name,
@@ -1162,13 +1268,56 @@ impl ProviderClient {
             .map(|m| m.content.clone())
             .unwrap_or_else(|| "You are ASI Code".to_string());
 
-        // Build messages for Claude, converting to content blocks if needed
+        // Build messages for Claude, replaying native tool history as content
+        // blocks: assistant tool_calls become tool_use blocks, and role="tool"
+        // messages become tool_result blocks grouped into the single user
+        // message that immediately follows the assistant turn (the shape the
+        // Anthropic API requires).
         let mut api_messages: Vec<Value> = Vec::new();
-        for m in messages
-            .iter()
-            .filter(|m| m.role == "user" || m.role == "assistant")
-        {
-            api_messages.push(json!({"role": m.role, "content": m.content}));
+        let mut pending_tool_results: Vec<Value> = Vec::new();
+        for m in messages.iter() {
+            if m.role == "tool" {
+                pending_tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.content
+                }));
+                continue;
+            }
+            if m.role != "user" && m.role != "assistant" {
+                continue;
+            }
+            if !pending_tool_results.is_empty() {
+                api_messages.push(json!({
+                    "role": "user",
+                    "content": std::mem::take(&mut pending_tool_results)
+                }));
+            }
+            if m.role == "assistant" && !m.tool_calls.is_empty() {
+                let mut blocks: Vec<Value> = Vec::new();
+                if !m.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": m.content}));
+                }
+                for tc in &m.tool_calls {
+                    let input: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or_else(|_| json!({}));
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": input
+                    }));
+                }
+                api_messages.push(json!({"role": "assistant", "content": blocks}));
+            } else {
+                api_messages.push(json!({"role": m.role, "content": m.content}));
+            }
+        }
+        if !pending_tool_results.is_empty() {
+            api_messages.push(json!({
+                "role": "user",
+                "content": std::mem::take(&mut pending_tool_results)
+            }));
         }
 
         // Append tool results as user messages with tool_result content blocks

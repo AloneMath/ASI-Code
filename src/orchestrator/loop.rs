@@ -361,6 +361,42 @@ fn run_turn_for_mode(
     (next, streamed)
 }
 
+/// Continue the native tool-calling protocol: re-invoke the model on the
+/// existing history (which ends with role="tool" results) without pushing
+/// any synthetic user message. Mirrors run_turn_for_mode's streaming
+/// behavior per mode.
+fn run_continuation_for_mode(
+    rt: &mut Runtime,
+    cfg: &AppConfig,
+    mode: LoopMode,
+    ui: Option<&Ui>,
+) -> (runtime::TurnResult, bool) {
+    let mut streamed = false;
+    let next = match mode {
+        LoopMode::ReplVerbose => {
+            if let Some(panel) = ui {
+                rt.run_continuation_streaming(|delta| {
+                    if !streamed {
+                        streamed = true;
+                        println!();
+                        print!("{} • ", panel.assistant_label());
+                    }
+                    print!("{}", delta);
+                    let _ = io::stdout().flush();
+                })
+            } else {
+                rt.run_continuation_streaming(|_| {})
+            }
+        }
+        LoopMode::PromptCompact => rt.run_continuation_streaming(|_| {}),
+    };
+    log_interaction_event(cfg, rt, "<native-continuation>", &next);
+    if streamed {
+        println!();
+    }
+    (next, streamed)
+}
+
 fn render_turn_output_for_mode(
     mode: LoopMode,
     ui: Option<&Ui>,
@@ -521,6 +557,13 @@ fn run_tool_loop_core(
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.80);
+    // Auto-compaction cap. 30-hour-plus sessions can need dozens of
+    // compaction rounds; the cap only exists to stop a pathological
+    // summarize-loop, so keep it generous and overridable.
+    let max_auto_compactions: usize = std::env::var("ASI_AUTO_COMPACT_MAX_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200);
     let mut auto_compactions_done: usize = 0;
 
     // Auto-test self-heal state (feature gated by ASI_AUTO_TEST=1).
@@ -563,7 +606,7 @@ fn run_tool_loop_core(
         // makes overnight 8-hour-plus tasks possible without context
         // exhaustion — we summarize once we cross the threshold, then
         // continue with a fresh head + recent tail.
-        if auto_compactions_done < 8 {
+        if auto_compactions_done < max_auto_compactions {
             let token_rec = if auto_compact_threshold > 0 {
                 rt.auto_compact_recommendation(auto_compact_threshold)
             } else {
@@ -750,6 +793,62 @@ fn run_tool_loop_core(
         if should_force_final_response_after_tool_result(&current)
             && is_auto_loop_continuable_stop_reason(&current.stop_reason)
         {
+            // Native tool-calling continuation. When history ends with
+            // role="tool" results, the protocol expects the model to be
+            // re-invoked directly — it decides whether to call more tools
+            // or give the final answer. The old behavior injected a
+            // "provide the final answer now" prompt here, which pressured
+            // models into stopping after the first tool round; that was a
+            // major cause of premature task abandonment.
+            if rt.last_message_is_tool_result() {
+                let (next, streamed) = run_continuation_for_mode(rt, cfg, mode, ui);
+                observe_assistant_followup_turn(
+                    file_synopsis_cache,
+                    &mut canonical_observations,
+                    &mut failure_memory,
+                    &next,
+                );
+                render_turn_output_for_mode(mode, ui, markdown_render, &next, streamed, true);
+                if matches!(mode, LoopMode::ReplVerbose) {
+                    record_native_changed_files_for_mode(
+                        mode,
+                        &next.native_tool_calls,
+                        changed_files,
+                        change_events.as_deref_mut(),
+                        ui,
+                    );
+                }
+                if next.stop_reason == "provider_error" {
+                    current = next;
+                    break;
+                }
+                steps += next.native_tool_calls.len().max(1);
+                if is_tool_failure(&next) {
+                    consecutive_failures += 1;
+                } else if !next.native_tool_calls.is_empty() {
+                    consecutive_failures = 0;
+                }
+                if let Some(reason) = apply_followup_turn_updates(
+                    &next,
+                    &mut extra_cost,
+                    changed_files,
+                    &mut last_progress_count,
+                    &mut no_progress_rounds,
+                    &mut last_failure_category,
+                    &mut consecutive_constraint_blocks,
+                    limits.max_consecutive_constraint_blocks,
+                ) {
+                    loop_info(mode, ui, &format!("auto-agent stopped: {}", reason));
+                    loop_stop_reason = Some(reason);
+                    current = next;
+                    break;
+                }
+                current = next;
+                if !is_auto_loop_continuable_stop_reason(&current.stop_reason) {
+                    break;
+                }
+                continue;
+            }
             if should_enforce_bilingual_markdown_reports(task_input, changed_files)
                 && bilingual_md_retries < BILINGUAL_MD_ENFORCEMENT_MAX_RETRIES
             {

@@ -62,11 +62,14 @@ You can use tools in two ways:
   Example: bash("cargo build 2>&1")
 
 # Workflow for Code Tasks
+For any non-trivial engineering task (multi-file changes, new features, bug hunts, refactors), work plan-first:
 1. EXPLORE: Use glob_search and grep_search to understand the codebase structure and locate relevant files.
 2. READ: Use read_file to examine relevant files before making changes. Understand the code thoroughly.
-3. PLAN: Briefly state what you will change and why. Consider edge cases and dependencies.
-4. EDIT: Use edit_file for targeted changes to existing files, write_file for new files. Show diffs when editing.
-5. VERIFY: Use bash to run builds, tests, or linters to confirm changes work. Fix any errors that appear.
+3. PLAN: Before the first edit, output a short numbered plan (3-7 steps) describing what you will change, in what order, and how you will verify it. Keep each step concrete ("edit src/parser.rs: handle empty input", not "improve parser").
+4. EXECUTE: Work through the plan one step at a time, in order. Use edit_file for targeted changes to existing files, write_file for new files. After completing each step, briefly mark progress ("Step 2/5 done") before moving to the next.
+5. VERIFY: Use bash to run builds, tests, or linters after each meaningful change — not only at the very end. If verification fails, fix the cause and re-verify before continuing to the next step.
+6. If the plan turns out to be wrong mid-task (new information from a file read or test failure), revise the plan explicitly in one line, then continue executing the revised plan.
+For trivial single-step tasks (one obvious small edit, a single question), skip the plan and just do it.
 
 # Important Rules
 - For file edits, ALWAYS read the file first. The old_text in edit_file must be an EXACT match of existing content including whitespace.

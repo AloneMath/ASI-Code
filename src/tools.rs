@@ -248,6 +248,14 @@ pub fn run_tool(name: &str, args: &str) -> ToolResult {
             let cmd = extract_json_string_arg(args.trim(), &["command", "cmd", "shell", "script"])
                 .or_else(|| extract_key_value_string_arg(args.trim(), &["command", "cmd", "shell", "script"]))
                 .unwrap_or_else(|| normalize_bash_args(args));
+            // Models sometimes wrap internal tool invocations in shell
+            // blocks ("write_file path <<<CONTENT ..." inside a ```bash
+            // fence). Shelling those out fails with "'write_file' is not
+            // recognized" and burns retry rounds. Re-dispatch to the real
+            // tool instead.
+            if let Some((inner_tool, inner_args)) = split_internal_tool_invocation(&cmd) {
+                return run_tool(&inner_tool, &inner_args);
+            }
             bash(&cmd)
         }
         "screenshot" => screenshot(),
@@ -567,6 +575,70 @@ fn decode_key_value_text_value(raw: &str) -> String {
         out.push('\\');
     }
     out
+}
+
+/// Escape decoding for FILE PATH arguments. Unlike
+/// `decode_key_value_text_value`, this must NOT turn `\t`/`\n`/`\r` into
+/// control characters: on Windows a perfectly normal path like
+/// `D:\test_code\new_file.py` contains those two-character sequences as
+/// "backslash + directory initial". Decoding them corrupts the path
+/// (`D:<TAB>est_code...`) and every file tool then fails with os error 123
+/// ("filename, directory name, or volume label syntax is incorrect") —
+/// observed in the wild as models retrying edit_file repeatedly until the
+/// failure circuit breaker killed the whole run. Only `\\` and quote
+/// escapes are meaningful in paths; everything else stays literal.
+fn decode_path_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            match ch {
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                '\'' => out.push('\''),
+                _ => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+            }
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out
+}
+
+/// Detect a shell command that is actually an INTERNAL tool invocation the
+/// model mistakenly routed through bash (e.g. `write_file D:\x\a.py` inside
+/// a ```bash fence). Returns (tool_name, args) so the caller can re-dispatch
+/// to the real tool. Only fires for our own tool names that are not real
+/// shell executables, so legitimate commands never match.
+fn split_internal_tool_invocation(cmd: &str) -> Option<(String, String)> {
+    let trimmed = cmd.trim();
+    // Multi-line shell scripts (without heredoc markers) are left alone.
+    if trimmed.lines().count() > 1 && !trimmed.contains("<<<") {
+        return None;
+    }
+    let first = trimmed.split_whitespace().next()?;
+    let name = first.to_ascii_lowercase();
+    let internal = matches!(
+        name.as_str(),
+        "write_file" | "edit_file" | "read_file" | "glob_search" | "grep_search"
+            | "web_search" | "web_fetch"
+    );
+    if !internal {
+        return None;
+    }
+    let rest = trimmed[first.len()..].trim_start().to_string();
+    Some((name, rest))
 }
 
 fn looks_like_named_args(raw: &str, keys: &[&str]) -> bool {
@@ -1435,7 +1507,7 @@ fn parse_delimited_write(args: &str) -> (String, String) {
     // line file with a literal backslash-n in it, which then fails py_compile.
     let (path, content) = split_two(trimmed);
     (
-        decode_key_value_text_value(strip_surrounding_quotes(path)),
+        decode_path_value(strip_surrounding_quotes(path)),
         decode_key_value_text_value(strip_surrounding_quotes(content)),
     )
 }
@@ -1479,7 +1551,7 @@ fn parse_delimited_edit(args: &str) -> (String, String, String) {
     let (path, rest) = split_two(trimmed);
     let (old, new) = split_two(rest);
     (
-        decode_key_value_text_value(strip_surrounding_quotes(path)),
+        decode_path_value(strip_surrounding_quotes(path)),
         decode_key_value_text_value(strip_surrounding_quotes(old)),
         decode_key_value_text_value(strip_surrounding_quotes(new)),
     )
@@ -4323,6 +4395,8 @@ mod tests {
         build_windows_cache_dir_repair_command, edit_file, is_autoresearch_cache_path,
         grep_search,
         decode_key_value_text_value,
+        decode_path_value,
+        split_internal_tool_invocation,
         normalize_bash_args, normalize_grep_search_args, normalize_windows_shell_command,
         extract_json_usize_arg, extract_key_value_string_arg, extract_key_value_usize_arg,
         parse_click_xy_args,
@@ -4544,6 +4618,52 @@ runpy.run_path(script, run_name="__bridge__")
     fn decode_key_value_text_value_decodes_common_escapes() {
         let got = decode_key_value_text_value(r#"line1\nline2\tok\\done"#);
         assert_eq!(got, "line1\nline2\tok\\done");
+    }
+
+    #[test]
+    fn decode_path_value_keeps_windows_path_segments_literal() {
+        // A Windows path whose directory names start with t/n/r must NOT be
+        // escape-decoded into control characters (regression: os error 123).
+        let got = decode_path_value(r"D:\test_code\new_dir\readme.md");
+        assert_eq!(got, r"D:\test_code\new_dir\readme.md");
+        // Doubled backslashes still collapse, and quotes still unescape.
+        assert_eq!(decode_path_value(r"D:\\x\\y.txt"), r"D:\x\y.txt");
+    }
+
+    #[test]
+    fn split_internal_tool_invocation_detects_write_file_routed_through_bash() {
+        let got = split_internal_tool_invocation(r#"write_file D:\x\a.py "print(1)""#);
+        assert_eq!(
+            got,
+            Some(("write_file".to_string(), r#"D:\x\a.py "print(1)""#.to_string()))
+        );
+    }
+
+    #[test]
+    fn split_internal_tool_invocation_ignores_real_shell_commands() {
+        assert_eq!(split_internal_tool_invocation("python -m pytest -q 2>&1"), None);
+        assert_eq!(split_internal_tool_invocation("Get-ChildItem -Name"), None);
+        assert_eq!(
+            split_internal_tool_invocation("echo hi\nGet-Date"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_delimited_write_preserves_windows_path_with_t_segment() {
+        let (path, content) =
+            parse_delimited_write(r#""D:\test_code\a.py" "print('x')""#);
+        assert_eq!(path, r"D:\test_code\a.py");
+        assert_eq!(content, "print('x')");
+    }
+
+    #[test]
+    fn parse_delimited_edit_preserves_windows_path_with_t_segment() {
+        let (path, old, new) =
+            parse_delimited_edit(r#""D:\test_code\a.py" "old text" "new text""#);
+        assert_eq!(path, r"D:\test_code\a.py");
+        assert_eq!(old, "old text");
+        assert_eq!(new, "new text");
     }
 
     #[test]

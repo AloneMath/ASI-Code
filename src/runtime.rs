@@ -5,7 +5,7 @@ use crate::meta::DEFAULT_SYSTEM_PROMPT;
 use crate::permissions;
 use crate::provider::{
     tool_call_to_legacy_args, ChatMessage, ChatProvider, CompletionResult, ProviderClient,
-    StreamingResult,
+    StreamingResult, ToolCallSpec,
 };
 use crate::sandbox::{SandboxPreflightContext, SandboxStrategy};
 use crate::security;
@@ -431,10 +431,7 @@ impl Runtime {
             max_turns,
             client,
             tool_runner,
-            messages: vec![ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt,
-            }],
+            messages: vec![ChatMessage::text("system".to_string(), system_prompt)],
             cumulative_input_tokens: 0,
             cumulative_output_tokens: 0,
             cumulative_cost_usd: 0.0,
@@ -576,10 +573,7 @@ impl Runtime {
         }
 
         let input_tokens = estimate_tokens(user_text);
-        self.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: user_text.to_string(),
-        });
+        self.messages.push(ChatMessage::text("user".to_string(), user_text.to_string()));
 
         let thinking = if self.extended_thinking {
             Some(generate_thinking(user_text))
@@ -594,6 +588,43 @@ impl Runtime {
 
         // Fallback: legacy text-based streaming
         self.run_legacy_text_turn(input_tokens, thinking, &mut on_delta)
+    }
+
+    /// Whether the last history entry is a role="tool" result, meaning the
+    /// native protocol expects the assistant to be re-invoked with no new
+    /// user message (the model continues from its own tool results).
+    pub fn last_message_is_tool_result(&self) -> bool {
+        self.messages.last().map(|m| m.role == "tool").unwrap_or(false)
+    }
+
+    /// Continue the conversation after native tool results WITHOUT pushing a
+    /// synthetic user message. This is how tool-trained models expect the
+    /// loop to run: assistant(tool_calls) -> tool results -> assistant
+    /// continues. Injecting "please continue" user prompts between rounds
+    /// (the old behavior) both wasted tokens and pushed the model
+    /// off-distribution.
+    pub fn run_continuation_streaming<F>(&mut self, mut on_delta: F) -> TurnResult
+    where
+        F: FnMut(&str),
+    {
+        let turns = self.turn_count();
+        if turns >= self.max_turns {
+            self.record_stop_reason("max_turns_reached");
+            return TurnResult {
+                text: "Max turns reached".to_string(),
+                stop_reason: "max_turns_reached".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                total_input_tokens: self.cumulative_input_tokens,
+                total_output_tokens: self.cumulative_output_tokens,
+                is_tool_result: false,
+                turn_cost_usd: 0.0,
+                total_cost_usd: self.cumulative_cost_usd,
+                thinking: None,
+                native_tool_calls: Vec::new(),
+            };
+        }
+        self.run_native_tool_turn(0, None, &mut on_delta)
     }
 
     fn provider_retry_limit() -> usize {
@@ -1047,14 +1078,8 @@ impl Runtime {
         let max_rounds = Self::length_continuation_max_rounds();
 
         while stop_reason == "length" && rounds < max_rounds {
-            self.messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: combined.clone(),
-            });
-            self.messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: LENGTH_CONTINUATION_PROMPT.to_string(),
-            });
+            self.messages.push(ChatMessage::text("assistant".to_string(), combined.clone()));
+            self.messages.push(ChatMessage::text("user".to_string(), LENGTH_CONTINUATION_PROMPT.to_string()));
             let (next, _) = self.complete_streaming_with_resilience(on_delta)?;
             if !next.text.is_empty() {
                 combined.push_str(&next.text);
@@ -1094,11 +1119,11 @@ impl Runtime {
                 let turn_cost = cost::estimate_cost_usd(&self.model, input_tokens, output_tokens);
                 self.cumulative_cost_usd += turn_cost;
 
-                if !completion_text.is_empty() {
-                    self.messages.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: completion_text.clone(),
-                    });
+                if !completion_text.is_empty() && completion.tool_calls.is_empty() {
+                    self.messages.push(ChatMessage::text(
+                        "assistant",
+                        completion_text.clone(),
+                    ));
                 }
 
                 if completion.tool_calls.is_empty() {
@@ -1354,28 +1379,22 @@ impl Runtime {
 
                 self.consume_next_permissions();
 
-                if completion_text.is_empty() {
-                    self.messages.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: format!("[executing {} tool call(s)]", native_results.len()),
-                    });
-                }
-                let results_summary: Vec<String> = native_results
-                    .iter()
-                    .map(|nr| {
-                        format!(
-                            "[tool:{}:{}]\n{}",
-                            nr.tool_name,
-                            if nr.ok { "ok" } else { "error" },
-                            compact_tool_result_for_history(&nr.tool_name, &nr.result_text)
-                        )
-                    })
-                    .collect();
-                if !results_summary.is_empty() {
-                    self.messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: format!("Tool results:\n{}", results_summary.join("\n\n")),
-                    });
+                // Record history in the native tool-calling protocol shape:
+                // one assistant message carrying the original tool_calls
+                // array, then one role="tool" message per result, paired by
+                // tool_call_id. Models are trained on exactly this exchange;
+                // the previous flattening (fake assistant text + results as
+                // a user message) pushed them off-distribution and caused
+                // erratic early stops and invented pseudo-XML call formats.
+                self.messages.push(ChatMessage::assistant_with_tool_calls(
+                    completion_text.clone(),
+                    completion.tool_calls.iter().map(ToolCallSpec::from_call).collect(),
+                ));
+                for nr in &native_results {
+                    self.messages.push(ChatMessage::tool_result(
+                        nr.tool_call_id.clone(),
+                        compact_tool_result_for_history(&nr.tool_name, &nr.result_text),
+                    ));
                 }
 
                 let mut display_text = completion_text;
@@ -1454,10 +1473,7 @@ impl Runtime {
                 let turn_cost_usd =
                     cost::estimate_cost_usd(&self.model, input_tokens, output_tokens);
                 self.cumulative_cost_usd += turn_cost_usd;
-                self.messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: text.clone(),
-                });
+                self.messages.push(ChatMessage::text("assistant".to_string(), text.clone()));
 
                 let mut display_text = text;
                 if let Some(note) = fallback_note {
@@ -1762,14 +1778,8 @@ impl Runtime {
             if r.ok { "ok" } else { "error" },
             r.output
         );
-        self.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: user_text.to_string(),
-        });
-        self.messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: compact_tool_result_for_history(&name, &txt),
-        });
+        self.messages.push(ChatMessage::text("user".to_string(), user_text.to_string()));
+        self.messages.push(ChatMessage::text("assistant".to_string(), compact_tool_result_for_history(&name, &txt)));
         self.record_stop_reason("tool_result");
         TurnResult {
             text: txt,
@@ -1858,14 +1868,8 @@ impl Runtime {
             }
 
             if outcome.stop_reason == "tool_result" {
-                self.messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: outcome.command.clone(),
-                });
-                self.messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: compact_tool_result_for_history(&outcome.tool_name, &outcome.text),
-                });
+                self.messages.push(ChatMessage::text("user".to_string(), outcome.command.clone()));
+                self.messages.push(ChatMessage::text("assistant".to_string(), compact_tool_result_for_history(&outcome.tool_name, &outcome.text)));
             }
 
             results.push(TurnResult {
@@ -2041,17 +2045,11 @@ continued without losing critical state. Output ONLY the summary, no preamble. U
 Keep the whole summary under 800 tokens. Be specific, not generic.";
 
         let summary_msgs = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: summary_instructions.to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: format!(
+            ChatMessage::text("system".to_string(), summary_instructions.to_string()),
+            ChatMessage::text("user".to_string(), format!(
                     "Summarize the following session transcript (the head is the oldest, the tail is the most recent).\n\n{}",
                     transcript
-                ),
-            },
+                )),
         ];
 
         let mut summary_text = String::new();
@@ -2068,13 +2066,10 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
                 // model treats it as authoritative history. Wrap with a clear
                 // boundary header so downstream prompts and reviewers can see
                 // exactly where the compaction kicked in.
-                let synthesized = ChatMessage {
-                    role: "assistant".to_string(),
-                    content: format!(
+                let synthesized = ChatMessage::text("assistant".to_string(), format!(
                         "[COMPACTED CONTEXT — summary of earlier turns]\n{}\n[END OF COMPACTED SUMMARY]",
                         summary_text.trim()
-                    ),
-                };
+                    ));
                 let mut new_msgs: Vec<ChatMessage> = Vec::with_capacity(2 + keep_tail.len());
                 if let Some(sys) = system_msg {
                     new_msgs.push(sys);
@@ -2158,17 +2153,11 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
     /// model turn sees it in context. Does not touch token counters —
     /// those are updated on the next `run_turn_streaming` call.
     pub fn push_user_message(&mut self, content: &str) {
-        self.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: content.to_string(),
-        });
+        self.messages.push(ChatMessage::text("user".to_string(), content.to_string()));
     }
 
     pub fn clear(&mut self) {
-        self.messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: DEFAULT_SYSTEM_PROMPT.to_string(),
-        }];
+        self.messages = vec![ChatMessage::text("system".to_string(), DEFAULT_SYSTEM_PROMPT.to_string())];
         self.cumulative_input_tokens = 0;
         self.cumulative_output_tokens = 0;
         self.cumulative_cost_usd = 0.0;
@@ -2197,11 +2186,21 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
         self.last_provider_error_message = None;
         self.last_stop_reason_raw = None;
         self.last_stop_reason_alias = None;
-        self.messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: DEFAULT_SYSTEM_PROMPT.to_string(),
-        }];
+        self.messages = vec![ChatMessage::text("system".to_string(), DEFAULT_SYSTEM_PROMPT.to_string())];
         for v in loaded {
+            // Prefer full-fidelity deserialization so native tool_calls /
+            // tool role messages saved by newer builds round-trip intact.
+            if let Ok(msg) = serde_json::from_value::<ChatMessage>(v.clone()) {
+                let keep = match msg.role.as_str() {
+                    "user" | "assistant" => !msg.content.is_empty() || !msg.tool_calls.is_empty(),
+                    "tool" => msg.tool_call_id.is_some(),
+                    _ => false,
+                };
+                if keep {
+                    self.messages.push(msg);
+                }
+                continue;
+            }
             let role = v
                 .get("role")
                 .and_then(|x| x.as_str())
@@ -2213,7 +2212,7 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
                 .unwrap_or("")
                 .to_string();
             if (role == "user" || role == "assistant") && !content.is_empty() {
-                self.messages.push(ChatMessage { role, content });
+                self.messages.push(ChatMessage::text(role, content));
             }
         }
         self.cumulative_input_tokens = 0;
@@ -2228,7 +2227,7 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
     pub fn as_json_messages(&self) -> Vec<serde_json::Value> {
         self.messages
             .iter()
-            .map(|m| json!({"role": m.role, "content": m.content}))
+            .map(|m| serde_json::to_value(m).unwrap_or_else(|_| json!({"role": m.role, "content": m.content})))
             .collect()
     }
 
@@ -2918,11 +2917,22 @@ fn is_known_tool(name: &str) -> bool {
     )
 }
 fn compact_tool_result_for_history(tool: &str, text: &str) -> String {
-    let limit = match tool {
-        "read_file" => 2600,
-        "web_fetch" => 2200,
-        _ => 12000,
+    // History retention limits per tool. read_file was previously clipped
+    // at 2,600 chars (~60-80 lines of code) — far too aggressive: the model
+    // would edit files it had only "seen" the top of, fail repeatedly, and
+    // trip the failure circuit breaker. Claude Code keeps ~2,000 lines in
+    // context; 40,000 chars (~1,000 lines) is a sane middle ground now that
+    // auto-compaction handles long-session token pressure.
+    let default_limit = match tool {
+        "read_file" => 40_000,
+        "web_fetch" => 20_000,
+        _ => 16_000,
     };
+    let limit = std::env::var("ASI_HISTORY_TOOL_RESULT_MAX_CHARS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 1_000)
+        .unwrap_or(default_limit);
 
     if text.chars().count() <= limit {
         return text.to_string();
@@ -4488,10 +4498,7 @@ mod tests {
             10,
         );
         for i in 0..8usize {
-            rt.messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: format!("msg {}", i),
-            });
+            rt.messages.push(ChatMessage::text("user".to_string(), format!("msg {}", i)));
         }
         // 8 user turns of 10 = 80%, threshold at 0.80 -> ceil(8.0) = 8 -> fires
         assert!(rt.auto_compact_recommendation_by_turns(0.80).is_some());
@@ -4510,10 +4517,7 @@ mod tests {
             "workspace-write".to_string(),
             0,
         );
-        rt.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: "x".to_string(),
-        });
+        rt.messages.push(ChatMessage::text("user".to_string(), "x".to_string()));
         assert!(rt.auto_compact_recommendation_by_turns(0.5).is_none());
     }
 

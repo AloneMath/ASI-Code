@@ -89,7 +89,11 @@ impl Default for AppConfig {
             auto_review_mode: "off".to_string(),
             auto_review_severity_threshold: "high".to_string(),
             execution_speed: "deep".to_string(),
-            max_turns: 200,
+            // High turn ceiling so long-horizon agent runs (30h+) aren't cut
+            // off mid-task; auto-compaction keeps the context bounded, and
+            // the auto-loop's progress/failure circuit breakers are the real
+            // stop conditions.
+            max_turns: 100_000,
             extended_thinking: false,
             markdown_render: true,
             theme: "dark".to_string(),

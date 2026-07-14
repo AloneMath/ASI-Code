@@ -106,6 +106,48 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
                         consumed += 1;
                         break;
                     }
+                } else if name == "write_file"
+                    && !raw.contains("<<<")
+                    && write_file_args_are_path_only(rest)
+                {
+                    // `/toolcall write_file <path>` with the file CONTENT on
+                    // the following lines, no heredoc markers. Observed from
+                    // DeepSeek: it lists the path on the /toolcall line and
+                    // dumps the file body right below. Without this branch
+                    // the content lines are dropped and a 0-byte file is
+                    // written — the loop then burns rounds "fixing" files
+                    // that were never written. Capture until the next
+                    // /toolcall line (or fence/tag boundary) and rewrite to
+                    // the canonical heredoc form.
+                    let mut content_lines: Vec<&str> = Vec::new();
+                    let mut peeked = 0usize;
+                    while i + consumed + peeked + 1 < lines.len() {
+                        let next = lines[i + consumed + peeked + 1];
+                        let nt = next.trim_start();
+                        if nt.starts_with("/toolcall ") || nt.starts_with("```") {
+                            break;
+                        }
+                        content_lines.push(next);
+                        peeked += 1;
+                    }
+                    while content_lines
+                        .last()
+                        .map(|l| l.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        content_lines.pop();
+                    }
+                    if !content_lines.is_empty() {
+                        // Consume every peeked line (trailing blanks included
+                        // — they were scanned and are semantically part of
+                        // the captured block).
+                        consumed += peeked;
+                        raw = format!(
+                            "{} <<<CONTENT\n{}\n<<<END",
+                            raw,
+                            content_lines.join("\n")
+                        );
+                    }
                 }
             }
         }
@@ -175,35 +217,106 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
 ///     read_file "hello.py" 1 50
 ///     < /toolcall >
 ///
-/// Recognize the single-line wrapper shape some DeepSeek models emit where
-/// the open tag, the bare tool invocation, and the close tag are all glued
-/// onto one line instead of split across separate lines:
+/// Recognize wrapper shapes some DeepSeek models emit where the open tag is
+/// glued to the tool invocation instead of sitting alone on its own line:
 ///
 ///     <toolcall>read_file buggy_calc.py 1 240</toolcall>
 ///     <tool_call>bash pytest -q</tool_call>
+///     <toolcall>write_file "a.py" "line1
+///     line2"</toolcall>
 ///
 /// Every other normalizer in this module assumes `<toolcall>`/`</toolcall>`
-/// markers sit alone on their own line, with the payload on subsequent
-/// lines. That assumption misses this single-line shape entirely: the line
-/// never matches `/toolcall `, so the whole response is silently parsed as
-/// zero tool calls. Left unhandled, the auto-loop treats a response like
-/// this as "no actions needed" and stops after a single turn even though
-/// the model clearly intended to run a tool.
+/// markers sit alone on their own line, with the payload on separate lines.
+/// That assumption misses these glued shapes entirely: the text never
+/// matches `/toolcall `, so the whole response is silently parsed as zero
+/// tool calls. Left unhandled, the auto-loop treats a response like this as
+/// "no actions needed" and stops even though the model clearly intended to
+/// run a tool.
 ///
 /// We only rewrite when the inner content starts with a known tool name
 /// (after normalizing aliases), so we don't accidentally rewrite prose that
-/// happens to be wrapped in unrelated `<toolcall>...</toolcall>`-shaped
-/// tags.
+/// happens to be wrapped in unrelated tags. For the multi-line form, the
+/// first line is promoted to a `/toolcall` line and subsequent lines are
+/// kept verbatim (minus the trailing close tag) so the downstream
+/// quote-balance / heredoc capture picks up the full argument body.
 fn normalize_single_line_toolcall_wrapper(text: &str) -> String {
-    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
-    for line in text.lines() {
-        if let Some(rewritten) = try_rewrite_single_line_toolcall_wrapper(line.trim()) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        if let Some(rewritten) = try_rewrite_single_line_toolcall_wrapper(line) {
             out.push(rewritten);
-        } else {
-            out.push(line.to_string());
+            i += 1;
+            continue;
         }
+
+        if let Some((head, close_tag)) = try_open_glued_toolcall_wrapper(line) {
+            // Multi-line form: scan ahead for the line that ends with the
+            // matching close tag. Cap the scan so unclosed tags don't eat
+            // the rest of the response.
+            let mut end: Option<usize> = None;
+            for (offset, candidate) in lines.iter().enumerate().skip(i + 1).take(400) {
+                if candidate.trim_end().to_ascii_lowercase().ends_with(close_tag) {
+                    end = Some(offset);
+                    break;
+                }
+            }
+            if let Some(end_idx) = end {
+                out.push(format!("/toolcall {}", head));
+                for mid in &lines[i + 1..end_idx] {
+                    out.push((*mid).to_string());
+                }
+                let last = lines[end_idx].trim_end();
+                let body_len = last.len() - close_tag.len();
+                let last_body = last[..body_len].trim_end();
+                if !last_body.is_empty() {
+                    out.push(last_body.to_string());
+                }
+                i = end_idx + 1;
+                continue;
+            }
+        }
+
+        out.push(lines[i].to_string());
+        i += 1;
     }
     out.join("\n")
+}
+
+/// If `line` begins with `<toolcall>`/`<tool_call>` glued to a known tool
+/// invocation but the close tag is NOT on this line, return the promoted
+/// invocation text and the close tag to scan for.
+fn try_open_glued_toolcall_wrapper(line: &str) -> Option<(String, &'static str)> {
+    let lower = line.to_ascii_lowercase();
+    let (open, close) = if lower.starts_with("<toolcall>") {
+        ("<toolcall>", "</toolcall>")
+    } else if lower.starts_with("<tool_call>") {
+        ("<tool_call>", "</tool_call>")
+    } else {
+        return None;
+    };
+    if lower.ends_with(close) {
+        return None; // single-line form, handled elsewhere
+    }
+    let inner = line[open.len()..].trim();
+    if inner.is_empty() || inner.starts_with('<') {
+        return None;
+    }
+    let first_token = inner.split_whitespace().next()?;
+    let normalized_name = normalize_tag_tool_name(&first_token.to_ascii_lowercase());
+    if !is_known_tool_name(&normalized_name) {
+        return None;
+    }
+    let rest = inner[first_token.len()..].trim_start();
+    let head = if rest.is_empty() {
+        normalized_name
+    } else {
+        format!("{} {}", normalized_name, rest)
+    };
+    Some((head, close))
 }
 
 fn try_rewrite_single_line_toolcall_wrapper(line: &str) -> Option<String> {
@@ -2755,6 +2868,32 @@ fn is_known_tool_name(name: &str) -> bool {
     )
 }
 
+/// True when the args after `write_file` are just a path (quoted or bare)
+/// with no inline content, no heredoc marker, and no named content= arg —
+/// the shape that means "the file body follows on the next lines".
+fn write_file_args_are_path_only(rest: &str) -> bool {
+    let after_name = match rest.strip_prefix("write_file") {
+        Some(a) => a.trim(),
+        None => return false,
+    };
+    if after_name.is_empty() || after_name.contains("<<<") {
+        return false;
+    }
+    let lower = after_name.to_ascii_lowercase();
+    if lower.contains("content=") || lower.contains("content =") {
+        return false;
+    }
+    // Quoted path with nothing after the closing quote.
+    if let Some(q) = after_name.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        if let Some(end) = after_name[1..].find(q) {
+            return after_name[end + 2..].trim().is_empty();
+        }
+        return false;
+    }
+    // Bare path: exactly one whitespace-free token.
+    after_name.split_whitespace().count() == 1
+}
+
 fn parse_tool_name_for_capture(rest: &str) -> Option<String> {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
@@ -3041,6 +3180,44 @@ mod tests {
         assert_eq!(calls[0].args, "buggy_calc.py 1 240");
         assert_eq!(calls[1].name, "read_file");
         assert_eq!(calls[1].args, "test_buggy_calc.py 1 240");
+    }
+
+    #[test]
+    fn captures_write_file_path_only_with_body_on_following_lines() {
+        // DeepSeek shape: `/toolcall write_file <path>` then the raw file
+        // body on the next lines with no heredoc markers. Regression: this
+        // used to write 0-byte files.
+        let text = "/toolcall write_file D:\\test_code\\todo_app\\todo\\models.py\nfrom dataclasses import dataclass\n\n@dataclass\nclass Task:\n    id: int\n";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert!(calls[0].args.contains("models.py"));
+        assert!(calls[0].args.contains("dataclass"));
+        assert!(calls[0].args.contains("class Task:"));
+    }
+
+    #[test]
+    fn path_only_write_file_capture_stops_at_next_toolcall() {
+        let text = "/toolcall write_file a.py\nprint(1)\n/toolcall bash \"python a.py 2>&1\"";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "write_file");
+        assert!(calls[0].args.contains("print(1)"));
+        assert!(!calls[0].args.contains("python a.py"));
+        assert_eq!(calls[1].name, "bash");
+    }
+
+    #[test]
+    fn extracts_multiline_glued_toolcall_wrapper_write_file() {
+        // Open tag glued to the invocation, quoted multi-line content, and
+        // the close tag glued to the end of the last content line.
+        let text = "<toolcall>write_file \"a.py\" \"def add(a, b):\n    return a + b\n\"</toolcall>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert!(calls[0].args.contains("a.py"));
+        assert!(calls[0].args.contains("return a + b"));
+        assert!(!calls[0].args.contains("</toolcall>"));
     }
 
     #[test]

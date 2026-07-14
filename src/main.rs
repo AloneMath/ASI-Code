@@ -560,14 +560,8 @@ impl SubagentManager {
 
     fn fresh_history(task: &str) -> Vec<ChatMessage> {
         vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: subagent_system_prompt().to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: task.to_string(),
-            },
+            ChatMessage::text("system".to_string(), subagent_system_prompt().to_string()),
+            ChatMessage::text("user".to_string(), task.to_string()),
         ]
     }
 
@@ -682,10 +676,7 @@ impl SubagentManager {
         if no_context {
             state.history = Self::fresh_history(task_trimmed);
         } else {
-            state.history.push(ChatMessage {
-                role: "user".to_string(),
-                content: task_trimmed.to_string(),
-            });
+            state.history.push(ChatMessage::text("user".to_string(), task_trimmed.to_string()));
         }
 
         let rx = Self::launch_run(run_cfg.clone(), state.history.clone());
@@ -780,10 +771,7 @@ impl SubagentManager {
         state.finished_at_ms = None;
         state.output_preview = None;
         state.submitted_turns = state.submitted_turns.saturating_add(1);
-        state.history.push(ChatMessage {
-            role: "user".to_string(),
-            content: format!("Retry previous task: {}", retry_task),
-        });
+        state.history.push(ChatMessage::text("user".to_string(), format!("Retry previous task: {}", retry_task)));
         let rx = Self::launch_run(run_cfg.clone(), state.history.clone());
         self.active.insert(id.to_string(), rx);
         let msg = format!(
@@ -989,10 +977,7 @@ impl SubagentManager {
             state.finished_at_ms = Some(done.finished_at_ms);
             state.output_preview = Some(match &done.result {
                 Ok(text) => {
-                    state.history.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: text.clone(),
-                    });
+                    state.history.push(ChatMessage::text("assistant".to_string(), text.clone()));
                     clip_chars(text.trim(), 240)
                 }
                 Err(err) => clip_chars(err.trim(), 240),
@@ -10319,18 +10304,27 @@ fn parse_auto_limit_duration(raw: &str) -> Option<Duration> {
         return Some(Duration::from_secs(u64::MAX / 4));
     }
     if let Ok(sec) = v.parse::<u64>() {
-        return Some(Duration::from_secs(sec.clamp(30, 24 * 60 * 60)));
+        return Some(Duration::from_secs(sec.clamp(30, MAX_AUTO_LOOP_DURATION_SECS)));
     }
     None
 }
+
+/// Upper clamp for auto-loop wall-clock duration: 7 days. Long-horizon
+/// agent runs (Claude Code-style 30h+ sessions) must not be cut off by an
+/// arbitrary 24h ceiling; real safety comes from the no-progress and
+/// failure circuit breakers, not the clock.
+const MAX_AUTO_LOOP_DURATION_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn parse_auto_loop_limits_from_env(default_max_steps: usize) -> AutoLoopLimits {
     let env_steps = parse_usize_env("ASI_AUTO_AGENT_MAX_STEPS", default_max_steps);
     let max_steps = if env_steps == 0 { None } else { Some(env_steps) };
 
-    let max_duration_secs = parse_usize_env("ASI_AUTO_AGENT_MAX_DURATION_SECS", 3600);
+    // Default wall-clock budget: 30 hours. Overridable via env; the real
+    // stop conditions are progress/failure based, so a generous default
+    // lets overnight and multi-day tasks run to completion.
+    let max_duration_secs = parse_usize_env("ASI_AUTO_AGENT_MAX_DURATION_SECS", 30 * 60 * 60);
     let max_duration =
-        Duration::from_secs((max_duration_secs as u64).clamp(30, 24 * 60 * 60));
+        Duration::from_secs((max_duration_secs as u64).clamp(30, MAX_AUTO_LOOP_DURATION_SECS));
 
     let max_no_progress_rounds = parse_usize_env("ASI_AUTO_AGENT_MAX_NO_PROGRESS_ROUNDS", 12)
         .clamp(1, 200);
@@ -10418,7 +10412,7 @@ pub(crate) fn apply_adaptive_budgets(
                 .map(|v| ((v as f64) * (0.65 * speed_boost)).round() as usize);
             out.max_duration = Duration::from_secs(
                 ((out.max_duration.as_secs_f64() * (0.7 * speed_boost)) as u64)
-                    .clamp(30, 24 * 60 * 60),
+                    .clamp(30, MAX_AUTO_LOOP_DURATION_SECS),
             );
             out.max_no_progress_rounds = ((out.max_no_progress_rounds as f64) * (0.65 * speed_boost))
                 .round()
@@ -10430,7 +10424,7 @@ pub(crate) fn apply_adaptive_budgets(
                 .map(|v| ((v as f64) * (0.95 * strict_boost * speed_boost)).round() as usize);
             out.max_duration = Duration::from_secs(
                 ((out.max_duration.as_secs_f64() * (0.95 * strict_boost * speed_boost)) as u64)
-                    .clamp(30, 24 * 60 * 60),
+                    .clamp(30, MAX_AUTO_LOOP_DURATION_SECS),
             );
             out.max_no_progress_rounds = ((out.max_no_progress_rounds as f64)
                 * (0.95 * strict_boost * speed_boost))
@@ -10443,7 +10437,7 @@ pub(crate) fn apply_adaptive_budgets(
                 .map(|v| ((v as f64) * (1.35 * strict_boost * speed_boost)).round() as usize);
             out.max_duration = Duration::from_secs(
                 ((out.max_duration.as_secs_f64() * (1.35 * strict_boost * speed_boost)) as u64)
-                    .clamp(30, 24 * 60 * 60),
+                    .clamp(30, MAX_AUTO_LOOP_DURATION_SECS),
             );
             out.max_no_progress_rounds = ((out.max_no_progress_rounds as f64)
                 * (1.35 * strict_boost * speed_boost))
