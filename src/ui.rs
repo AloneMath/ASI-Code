@@ -10,6 +10,24 @@ const CUBIST_DIFF_REMOVED: &str = "38;2;240;230;210;48;2;176;90;60";
 const CUBIST_DIFF_ADDED: &str = "38;2;34;34;34;48;2;122;143;92";
 const CUBIST_SPINNER_FRAMES: [&str; 6] = ["\u{25C6}", "\u{25C7}", "\u{25B2}", "\u{25B3}", "\u{25B0}", "\u{25B1}"];
 
+// ── Aurora theme ────────────────────────────────────────────────────────
+// A Claude Code / Codex-inspired look: soft truecolor gradient accents,
+// star-glyph spinner, `●` tool headers with `⎿` result gutters, rounded
+// cards, and quiet dim metadata. Designed to feel calm and hand-crafted
+// rather than terminal-loud.
+const AURORA_CORAL: &str = "38;2;255;138;101";
+const AURORA_VIOLET: &str = "38;2;167;139;250";
+const AURORA_TEAL: &str = "38;2;94;234;212";
+const AURORA_ROSE: &str = "38;2;251;113;133";
+const AURORA_MIST: &str = "38;2;138;143;158";
+const AURORA_GOLD: &str = "38;2;250;204;21";
+const AURORA_DIFF_REMOVED: &str = "38;2;255;205;210;48;2;103;44;52";
+const AURORA_DIFF_ADDED: &str = "38;2;209;250;229;48;2;24;84;62";
+const AURORA_GRAD_FROM: (u8, u8, u8) = (255, 138, 101);
+const AURORA_GRAD_TO: (u8, u8, u8) = (167, 139, 250);
+const AURORA_SPINNER_FRAMES: [&str; 8] =
+    ["\u{273B}", "\u{273C}", "\u{273D}", "\u{2733}", "\u{2731}", "\u{2733}", "\u{273D}", "\u{273C}"];
+
 pub struct Ui {
     color: bool,
     theme: String,
@@ -40,6 +58,9 @@ impl Ui {
         if self.theme == "cubist" {
             return self.welcome_mosaic(cwd);
         }
+        if self.theme == "aurora" {
+            return self.welcome_aurora(cwd);
+        }
         self.rounded_box(
             &[
                 format!("\u{2736} Welcome to {}!", APP_NAME),
@@ -48,6 +69,50 @@ impl Ui {
             ],
             self.warn_code(),
         )
+    }
+
+    fn welcome_aurora(&self, cwd: &str) -> String {
+        // Claude Code-style greeting: a starburst glyph, gradient wordmark,
+        // then quiet metadata lines. No heavy box — whitespace is the frame.
+        let star = self.paint("\u{273B}", AURORA_CORAL);
+        let word = self.gradient_text(APP_NAME);
+        let version = self.dim(&format!("v{}", APP_VERSION));
+        let rule = self.paint(&"\u{2500}".repeat(44), AURORA_MIST);
+        let hint = format!(
+            "{}  {}  {}",
+            self.dim("/help"),
+            self.dim("/status"),
+            self.dim("/theme"),
+        );
+        [
+            format!("{} {} {}", star, word, version),
+            self.dim(&format!("  {}", cwd)),
+            format!("  {}", hint),
+            format!("  {}", rule),
+        ]
+        .join("\n")
+    }
+
+    /// Paint each character of `text` with a color interpolated between the
+    /// aurora gradient endpoints. Falls back to plain text when color is off.
+    fn gradient_text(&self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len().max(1);
+        let (fr, fg, fb) = AURORA_GRAD_FROM;
+        let (tr, tg, tb) = AURORA_GRAD_TO;
+        let mut out = String::new();
+        for (i, c) in chars.iter().enumerate() {
+            let t = i as f64 / (n.saturating_sub(1).max(1)) as f64;
+            let r = (fr as f64 + (tr as f64 - fr as f64) * t).round() as u8;
+            let g = (fg as f64 + (tg as f64 - fg as f64) * t).round() as u8;
+            let b = (fb as f64 + (tb as f64 - fb as f64) * t).round() as u8;
+            out.push_str(&format!("\x1b[1;38;2;{};{};{}m{}", r, g, b, c));
+        }
+        out.push_str("\x1b[0m");
+        out
     }
 
     fn welcome_mosaic(&self, cwd: &str) -> String {
@@ -139,6 +204,27 @@ impl Ui {
             ]
             .join("\n");
         }
+        if self.theme == "aurora" {
+            return [
+                self.dim("  Try:"),
+                format!(
+                    "  {} {}",
+                    self.paint("\u{00B7}", AURORA_CORAL),
+                    self.dim("\"scaffold a feature\" or \"inspect this repository\"")
+                ),
+                format!(
+                    "  {} {}",
+                    self.paint("\u{00B7}", AURORA_VIOLET),
+                    self.dim("precise prompts for edits, commands, and debugging")
+                ),
+                format!(
+                    "  {} {}",
+                    self.paint("\u{00B7}", AURORA_TEAL),
+                    self.dim("auto mode is on \u{2014} /auto off for manual tool control")
+                ),
+            ]
+            .join("\n");
+        }
         [
             self.dim("Tips for getting started:"),
             "1. Ask ASI Code to scaffold a feature or inspect a repository".to_string(),
@@ -153,18 +239,38 @@ impl Ui {
         if self.theme == "cubist" {
             return format!("{} ", self.accent("\u{25B0}\u{25B0}\u{25B1}\u{25B1} ASI Code \u{25B8}"));
         }
+        if self.theme == "aurora" {
+            return format!("{} ", self.paint("\u{276F}", AURORA_CORAL));
+        }
         format!("{} ", self.accent("ASI Code>"))
     }
 
     pub fn assistant_label(&self) -> String {
         if self.theme == "cubist" {
             self.accent("\u{25C6} ASI Code")
+        } else if self.theme == "aurora" {
+            self.paint("\u{273B}", AURORA_CORAL)
         } else {
             self.accent("ASI Code")
         }
     }
 
     pub fn assistant(&self, text: &str) -> String {
+        if self.theme == "aurora" {
+            // Claude Code style: a single star bullet, body indented under it.
+            let mut out = String::new();
+            for (i, line) in text.lines().enumerate() {
+                if i == 0 {
+                    out.push_str(&format!("{} {}", self.assistant_label(), line));
+                } else {
+                    out.push_str(&format!("\n  {}", line));
+                }
+            }
+            if text.is_empty() {
+                out.push_str(&self.assistant_label());
+            }
+            return out;
+        }
         let bullet = if self.theme == "cubist" { "\u{25C7}" } else { "\u{2022}" };
         format!("{}\n{} {}", self.assistant_label(), bullet, text)
     }
@@ -179,9 +285,42 @@ impl Ui {
             let styled_body = self.style_tool_body(name, body);
             return format!("{}\n{}\n{}\n{}", head, border, styled_body, border);
         }
+        if self.theme == "aurora" {
+            return self.tool_panel_aurora(name, status, body);
+        }
         let head = self.warn(&format!("TOOL {} ({})", name, status));
         let border = self.dim("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
         format!("{}\n{}\n{}\n{}", head, border, body, border)
+    }
+
+    /// Claude Code-style tool rendering: a colored `●` header naming the
+    /// tool, then the result body in a `⎿`-anchored dim gutter. Long bodies
+    /// are shown in full but the gutter keeps them visually secondary.
+    fn tool_panel_aurora(&self, name: &str, status: &str, body: &str) -> String {
+        let dot_color = if status == "ok" || status == "result" {
+            AURORA_TEAL
+        } else {
+            AURORA_ROSE
+        };
+        let head = format!(
+            "{} {}{}",
+            self.paint("\u{25CF}", dot_color),
+            self.paint(name, "1"),
+            if status == "ok" || status == "result" {
+                String::new()
+            } else {
+                format!(" {}", self.paint(&format!("({})", status), AURORA_ROSE))
+            }
+        );
+        let styled_body = self.style_tool_body(name, body);
+        let mut out = String::new();
+        out.push_str(&head);
+        for (i, line) in styled_body.lines().enumerate() {
+            let gutter = if i == 0 { "\u{23BF} " } else { "   " };
+            out.push('\n');
+            out.push_str(&format!("  {}{}", self.paint(gutter, AURORA_MIST), line));
+        }
+        out
     }
 
     pub fn read_file_hidden_notice(&self, header: &str) -> String {
@@ -190,6 +329,13 @@ impl Ui {
                 "{}\n{}",
                 format!("{} {}", self.warn("\u{25E2}"), header),
                 self.dim("\u{25C7} content hidden \u{25C7} use /toolcall read_file <path> <start_line> <max_lines> for exact ranges"),
+            );
+        }
+        if self.theme == "aurora" {
+            return format!(
+                "{}\n  {}",
+                format!("{} {}", self.paint("\u{25CF}", AURORA_TEAL), self.dim(header)),
+                self.dim("\u{23BF} content folded \u{00B7} /toolcall read_file <path> <start> <lines> for exact ranges"),
             );
         }
         format!(
@@ -208,6 +354,24 @@ impl Ui {
             Some((h, r)) => (*h, r),
             None => ("tool call", &[]),
         };
+        if self.theme == "aurora" {
+            let head = format!(
+                "{} {}",
+                self.paint("\u{25CF}", AURORA_GOLD),
+                self.paint(head_line, "1"),
+            );
+            let mut out = String::new();
+            out.push_str(&head);
+            for (i, line) in rest_lines.iter().enumerate() {
+                if line.starts_with("</toolcall") {
+                    continue;
+                }
+                let gutter = if i == 0 { "\u{23BF} " } else { "   " };
+                out.push('\n');
+                out.push_str(&format!("  {}{}", self.paint(gutter, AURORA_MIST), self.dim(line)));
+            }
+            return out;
+        }
         let head = self.warn(&format!("\u{25E2}\u{25E3} INTENT \u{25B8} {}", head_line));
         let mut out = String::new();
         out.push_str(&head);
@@ -262,6 +426,22 @@ impl Ui {
                 ))
             );
         }
+        if self.theme == "aurora" {
+            let frame = AURORA_SPINNER_FRAMES
+                [((elapsed_secs.wrapping_mul(5)) % AURORA_SPINNER_FRAMES.len() as u64) as usize];
+            let verbs = ["Thinking", "Weaving", "Tracing", "Shaping", "Polishing"];
+            let verb = verbs[((elapsed_secs / 4) % verbs.len() as u64) as usize];
+            return format!(
+                "{} {}{} {}",
+                self.paint(frame, AURORA_CORAL),
+                self.paint(verb, AURORA_VIOLET),
+                self.paint("\u{2026}", AURORA_VIOLET),
+                self.dim(&format!(
+                    "({}s \u{00B7} {} tokens \u{00B7} esc to interrupt)",
+                    elapsed_secs, tokens
+                ))
+            );
+        }
         format!(
             "{} {}",
             self.warn("\u{2736} Spinning\u{2026}"),
@@ -280,6 +460,13 @@ impl Ui {
                 self.dim(&format!("({}s . {} tokens)", elapsed_secs, tokens))
             );
         }
+        if self.theme == "aurora" {
+            return format!(
+                "{} {}",
+                self.paint("\u{273B} Done", AURORA_TEAL),
+                self.dim(&format!("({}s \u{00B7} {} tokens)", elapsed_secs, tokens))
+            );
+        }
         format!(
             "{} {}",
             self.ok("\u{2713} Completed"),
@@ -295,6 +482,16 @@ impl Ui {
                     self.accent_code(),
                 )
                 .join("\n");
+        }
+        if self.theme == "aurora" {
+            // Italic dim thinking, indented — quiet, like Claude Code.
+            let mut out = String::new();
+            out.push_str(&self.paint("\u{2234} thinking", AURORA_VIOLET));
+            for line in text.lines() {
+                out.push('\n');
+                out.push_str(&format!("  {}", self.paint(line, &format!("3;{}", AURORA_MIST))));
+            }
+            return out;
         }
         self.rounded_box(
             &["Thinking".to_string(), text.to_string()],
@@ -314,12 +511,18 @@ impl Ui {
         if self.theme == "cubist" {
             return format!("{} {}", self.err("\u{25E2} ERROR"), text);
         }
+        if self.theme == "aurora" {
+            return format!("{} {}", self.paint("\u{2716} error", AURORA_ROSE), text);
+        }
         format!("{} {}", self.err("ERROR"), text)
     }
 
     pub fn info(&self, text: &str) -> String {
         if self.theme == "cubist" {
             return format!("{} {}", self.dim("\u{25C7} INFO"), text);
+        }
+        if self.theme == "aurora" {
+            return self.dim(&format!("\u{00B7} {}", text));
         }
         format!("{} {}", self.dim("INFO"), text)
     }
@@ -351,6 +554,31 @@ impl Ui {
                 })
                 .collect();
             return self.mosaic_panel(&lines, self.accent_code()).join("\n");
+        }
+        if self.theme == "aurora" {
+            // A single quiet metadata block with dotted leaders, no box.
+            let rows = [
+                ("project", project),
+                ("setup", setup_status),
+                ("auto", auto_agent),
+                ("sandbox", sandbox),
+                ("profile", profile),
+                ("speed", speed),
+            ];
+            let key_width = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+            return rows
+                .iter()
+                .map(|(k, v)| {
+                    let pad = key_width - k.chars().count();
+                    format!(
+                        "  {}{}  {}",
+                        self.paint(k, AURORA_MIST),
+                        self.paint(&format!(" {}", "\u{00B7}".repeat(pad + 2)), AURORA_MIST),
+                        v
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
         }
         [
             self.info(&format!("project={}", project)),
@@ -386,13 +614,25 @@ impl Ui {
     }
 
     pub fn progress_bar(&self, current: usize, total: usize) -> Option<String> {
-        if self.theme != "cubist" {
+        if self.theme != "cubist" && self.theme != "aurora" {
             return None;
         }
         let width: usize = 10;
         let total_safe = total.max(1);
         let filled = ((current.min(total) as f64 / total_safe as f64) * width as f64).round() as usize;
         let filled = filled.min(width);
+        if self.theme == "aurora" {
+            let mut bar = String::with_capacity(width * 3);
+            for i in 0..width {
+                bar.push_str(if i < filled { "\u{2501}" } else { "\u{2508}" });
+            }
+            return Some(format!(
+                "  {} {} {}",
+                self.paint(&bar, AURORA_VIOLET),
+                self.dim(&format!("{}/{}", current, total)),
+                self.paint("\u{273B}", AURORA_CORAL),
+            ));
+        }
         let mut bar = String::with_capacity(width * 3);
         for i in 0..width {
             bar.push_str(if i < filled { "\u{25B0}" } else { "\u{25B1}" });
@@ -415,6 +655,7 @@ impl Ui {
             ("dark-ansi", "Dark mode (ANSI colors only)"),
             ("light-ansi", "Light mode (ANSI colors only)"),
             ("cubist", "Cubist (Picasso-inspired truecolor)"),
+            ("aurora", "Aurora (Claude Code-inspired truecolor)"),
         ];
 
         let mut lines = vec![
@@ -513,6 +754,7 @@ impl Ui {
     fn accent_code(&self) -> &str {
         match self.theme.as_str() {
             "cubist" => CUBIST_COBALT,
+            "aurora" => AURORA_VIOLET,
             "light" => "34",
             "dark-colorblind" => "94",
             "light-colorblind" => "94",
@@ -525,6 +767,7 @@ impl Ui {
     fn warn_code(&self) -> &str {
         match self.theme.as_str() {
             "cubist" => CUBIST_OCHRE,
+            "aurora" => AURORA_GOLD,
             "light" => "35",
             "dark-colorblind" => "93",
             "light-colorblind" => "95",
@@ -537,6 +780,7 @@ impl Ui {
     fn ok_code(&self) -> &str {
         match self.theme.as_str() {
             "cubist" => CUBIST_SAGE,
+            "aurora" => AURORA_TEAL,
             "dark-colorblind" | "light-colorblind" => "96",
             _ => "32",
         }
@@ -545,6 +789,7 @@ impl Ui {
     fn err_code(&self) -> &str {
         match self.theme.as_str() {
             "cubist" => CUBIST_TERRA,
+            "aurora" => AURORA_ROSE,
             "dark-colorblind" | "light-colorblind" => "91",
             _ => "31",
         }
@@ -553,6 +798,7 @@ impl Ui {
     fn dim_code(&self) -> &str {
         match self.theme.as_str() {
             "cubist" => CUBIST_SLATE,
+            "aurora" => AURORA_MIST,
             "light" | "light-colorblind" | "light-ansi" => "30",
             _ => "90",
         }
@@ -561,6 +807,7 @@ impl Ui {
     fn diff_removed_code(&self) -> &str {
         match self.theme.as_str() {
             "cubist" => CUBIST_DIFF_REMOVED,
+            "aurora" => AURORA_DIFF_REMOVED,
             "light" | "light-colorblind" => "31",
             _ => "97;41",
         }
@@ -569,6 +816,7 @@ impl Ui {
     fn diff_added_code(&self) -> &str {
         match self.theme.as_str() {
             "cubist" => CUBIST_DIFF_ADDED,
+            "aurora" => AURORA_DIFF_ADDED,
             "light" | "light-colorblind" => "32",
             _ => "30;42",
         }
@@ -645,7 +893,7 @@ pub struct CubistStreamFilter {
 impl CubistStreamFilter {
     pub fn new(theme: &str) -> Self {
         Self {
-            enabled: theme == "cubist",
+            enabled: theme == "cubist" || theme == "aurora",
             theme: theme.to_string(),
             buf: String::new(),
             in_toolcall: false,
@@ -760,6 +1008,91 @@ fn visible_width(s: &str) -> usize {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn aurora_welcome_uses_gradient_and_star() {
+        let ui = Ui::new_with(true, "aurora");
+        let w = ui.welcome_card("D:\\test");
+        assert!(w.contains('\u{273B}'), "missing star glyph: {:?}", w);
+        assert!(w.contains("\x1b[1;38;2;"), "missing gradient escapes: {:?}", w);
+        assert!(w.contains("D:\\test"), "missing cwd: {:?}", w);
+    }
+
+    #[test]
+    fn aurora_prompt_is_minimal_chevron() {
+        let ui = Ui::new_with(false, "aurora");
+        let p = ui.input_prompt();
+        assert!(p.contains('\u{276F}'), "missing chevron: {:?}", p);
+        assert!(!p.contains("ASI Code>"), "should not use legacy prompt: {:?}", p);
+    }
+
+    #[test]
+    fn aurora_tool_panel_uses_dot_header_and_gutter() {
+        let ui = Ui::new_with(false, "aurora");
+        let p = ui.tool_panel("bash", "ok", "exit=0\nhello");
+        assert!(p.contains('\u{25CF}'), "missing dot header: {:?}", p);
+        assert!(p.contains('\u{23BF}'), "missing result gutter: {:?}", p);
+        assert!(p.contains("bash"));
+        assert!(!p.contains("TOOL bash"), "should not use legacy header: {:?}", p);
+    }
+
+    #[test]
+    fn aurora_tool_panel_error_status_is_visible() {
+        let ui = Ui::new_with(false, "aurora");
+        let p = ui.tool_panel("bash", "error", "boom");
+        assert!(p.contains("(error)"), "error status must be shown: {:?}", p);
+    }
+
+    #[test]
+    fn aurora_spinner_cycles_star_frames() {
+        let ui = Ui::new_with(false, "aurora");
+        let mut distinct = HashSet::new();
+        for sec in 0..8u64 {
+            let line = ui.spinning_line(sec, 0);
+            for f in &AURORA_SPINNER_FRAMES {
+                if line.starts_with(*f) {
+                    distinct.insert(*f);
+                }
+            }
+        }
+        assert!(distinct.len() >= 3, "expected >=3 frames, got {:?}", distinct);
+    }
+
+    #[test]
+    fn aurora_startup_card_uses_dotted_leaders() {
+        let ui = Ui::new_with(false, "aurora");
+        let card = ui.startup_card("D:\\demo", "ok", "on", "off", "standard", "deep");
+        assert!(card.contains("project"));
+        assert!(card.contains('\u{00B7}'), "missing dotted leader: {:?}", card);
+        assert!(!card.contains("INFO"), "should not use legacy INFO lines: {:?}", card);
+    }
+
+    #[test]
+    fn aurora_progress_bar_renders() {
+        let ui = Ui::new_with(false, "aurora");
+        let bar = ui.progress_bar(3, 10).expect("aurora should render bar");
+        assert!(bar.contains('\u{2501}'), "missing filled cell: {:?}", bar);
+        assert!(bar.contains('\u{2508}'), "missing empty cell: {:?}", bar);
+        assert!(bar.contains("3/10"));
+    }
+
+    #[test]
+    fn aurora_stream_filter_renders_intent_panel() {
+        let mut sf = CubistStreamFilter::new("aurora");
+        let mut out = String::new();
+        sf.write("hi <toolcall>\nread_file foo.rs\n</toolcall> bye", &mut out);
+        sf.flush(&mut out);
+        assert!(out.contains('\u{25CF}'), "missing intent dot: {:?}", out);
+        assert!(out.contains("read_file"));
+        assert!(!out.contains("<toolcall>"));
+    }
+
+    #[test]
+    fn aurora_theme_menu_lists_aurora_as_eighth() {
+        let ui = Ui::new_with(false, "dark");
+        let m = ui.theme_menu("dark");
+        assert!(m.contains("8. Aurora"), "expected 8th item Aurora: {:?}", m);
+    }
 
     #[test]
     fn cubist_welcome_contains_geometric_corners() {

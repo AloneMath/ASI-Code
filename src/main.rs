@@ -1625,7 +1625,9 @@ fn run_repl(
 ) -> Result<(), String> {
     let _sandbox_default_guard =
         ScopedEnvVar::set_default_if_unset("ASI_SANDBOX", SAFE_PROFILE_SANDBOX_MODE);
-    let is_cubist = cfg.theme == "cubist";
+    // "Quiet startup" themes suppress the plain project=/setup lines in
+    // favor of their own composed welcome cards.
+    let is_cubist = cfg.theme == "cubist" || cfg.theme == "aurora";
     let mut project_label: String = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -2078,7 +2080,7 @@ fn run_repl(
 
         if line == "/theme" {
             println!("{}", ui.theme_menu(&cfg.theme));
-            let value = prompt_input("Select style [1-7], Enter to keep")?;
+            let value = prompt_input("Select style [1-8], Enter to keep")?;
             if !value.trim().is_empty() {
                 if let Ok(idx) = value.trim().parse::<usize>() {
                     if let Some(key) = theme_from_index(idx) {
@@ -4444,7 +4446,7 @@ fn run_repl(
             std::sync::Arc<std::sync::atomic::AtomicBool>,
             std::thread::JoinHandle<()>,
         )> = if !is_tool_call {
-            if cfg.theme == "cubist" {
+            if cfg.theme == "cubist" || cfg.theme == "aurora" {
                 let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let stop_clone = std::sync::Arc::clone(&stop);
                 let start = Instant::now();
@@ -5137,6 +5139,7 @@ fn theme_from_index(index: usize) -> Option<&'static str> {
         5 => Some("dark-ansi"),
         6 => Some("light-ansi"),
         7 => Some("cubist"),
+        8 => Some("aurora"),
         _ => None,
     }
 }
