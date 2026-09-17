@@ -4565,11 +4565,14 @@ fn run_repl(
 
         let mut turn_cost_sum = result.turn_cost_usd;
         let mut auto_loop_stop_reason: Option<String> = None;
+        let auto_loop_started = should_start_auto_tool_loop(
+            auto_agent_enabled,
+            auto_tooling_enabled_for_turn,
+            is_tool_call,
+            &result,
+        );
         // Auto-agent loop: triggered by completed text or native tool_use results
-        if auto_tooling_enabled_for_turn
-            && !is_tool_call
-            && is_auto_loop_continuable_stop_reason(&result.stop_reason)
-        {
+        if auto_loop_started {
             let limits = adaptive_limits_for_turn;
             println!("{}", ui.info(&format_adaptive_budget_note(complexity_for_turn, repl_auto_loop_limits, limits)));
             let (loop_result, extra_cost, loop_stop_reason) = run_auto_tool_loop(
@@ -4595,7 +4598,7 @@ fn run_repl(
             auto_loop_stop_reason = loop_stop_reason;
             previous_auto_loop_stop_reason = auto_loop_stop_reason.clone();
         }
-        if auto_tooling_enabled_for_turn && !is_tool_call && result.stop_reason == "tool_use" {
+        if auto_loop_started && result.stop_reason == "tool_use" {
             println!(
                 "{}",
                 ui.info(
@@ -4606,7 +4609,7 @@ fn run_repl(
         if let Some(reason) = auto_loop_stop_reason.as_deref() {
             println!("{}", ui.info(&format!("auto_loop_stop_reason={}", reason)));
         }
-        if auto_tooling_enabled_for_turn && !is_tool_call {
+        if (auto_tooling_enabled_for_turn || auto_loop_started) && !is_tool_call {
             let _ = telemetry::log_auto_loop_summary(
                 &cfg,
                 &rt.provider,
@@ -11083,6 +11086,18 @@ fn is_auto_loop_continuable_stop_reason(stop_reason: &str) -> bool {
     ) || stop_reason.trim().eq_ignore_ascii_case("tool_result")
 }
 
+fn should_start_auto_tool_loop(
+    auto_agent_enabled: bool,
+    auto_tooling_enabled_for_turn: bool,
+    is_manual_tool_call: bool,
+    result: &runtime::TurnResult,
+) -> bool {
+    auto_agent_enabled
+        && !is_manual_tool_call
+        && is_auto_loop_continuable_stop_reason(&result.stop_reason)
+        && (auto_tooling_enabled_for_turn || should_force_final_response_after_tool_result(result))
+}
+
 fn looks_like_mixed_toolcall_and_result_output(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if !lower.contains("/toolcall") {
@@ -11356,70 +11371,69 @@ pub(crate) fn looks_like_pending_action_promise(text: &str) -> bool {
         return true;
     }
 
-    // Chinese-language promise / hand-off phrasings. Source kept ASCII via
-    // \u{...} escapes so no CJK literals appear in code. Group A is the
-    // "I will execute" promise pattern (model says it will run something
-    // but does not emit a tool call). Group B is the "you should run it"
-    // hand-off pattern (model pushes execution back to the user).
+    // Additional promise / hand-off phrasings commonly emitted by gateways.
+    // Group A is the "I will execute" promise pattern (the model says it
+    // will run something but does not emit a tool call). Group B is the
+    // "you should run it" hand-off pattern (execution is pushed to the user).
     //
-    // To add a new pattern: take the Chinese phrase, encode each CJK char
-    // as \u{HEX}, leave ASCII as-is, and place the literal here. The
-    // matching is byte-equality against the model's raw text, so the
-    // resulting UTF-8 sequence must be exactly what the model emits.
-    let cjk_promise_markers = [
-        // Group A: explicit "I will run / I am about to do X" promises.
-        "\u{6211}\u{73B0}\u{5728}\u{5C31}\u{76F4}\u{63A5}\u{8FD0}\u{884C}",
-        "\u{6211}\u{73B0}\u{5728}\u{5C31}\u{8FD0}\u{884C}",
-        "\u{6211}\u{4F1A}\u{76F4}\u{63A5}\u{8FD0}\u{884C}",
-        "\u{6211}\u{4F1A}\u{9A6C}\u{4E0A}\u{8FD0}\u{884C}",
-        "\u{6211}\u{4F1A}\u{7ACB}\u{5373}\u{8FD0}\u{884C}",
-        "\u{6211}\u{63A5}\u{4E0B}\u{6765}\u{4F1A}",
-        "\u{6211}\u{63A5}\u{4E0B}\u{6765}\u{8981}",
-        "\u{6211}\u{4E0B}\u{4E00}\u{6B65}\u{4F1A}",
-        "\u{6211}\u{4E0B}\u{4E00}\u{6B65}\u{5C06}",
-        "\u{7A0D}\u{540E}\u{6211}",
-        "\u{7A0D}\u{540E}\u{4F1A}",
-        "\u{8FD0}\u{884C}\u{540E}\u{628A}\u{7ED3}\u{679C}\u{56DE}\u{7ED9}\u{4F60}",
-        "\u{8FD0}\u{884C}\u{540E}\u{56DE}\u{62A5}",
-        "\u{8FD0}\u{884C}\u{540E}\u{544A}\u{8BC9}\u{4F60}",
-        // Group B: hand-off to user — model asks user to run it instead.
-        "\u{8BF7}\u{5728}\u{4F60}\u{672C}\u{5730}\u{7EC8}\u{7AEF}\u{8FD0}\u{884C}",
-        "\u{8BF7}\u{5728}\u{672C}\u{5730}\u{7EC8}\u{7AEF}\u{8FD0}\u{884C}",
-        "\u{8BF7}\u{4F60}\u{81EA}\u{5DF1}\u{6267}\u{884C}",
-        "\u{8BF7}\u{4F60}\u{81EA}\u{5DF1}\u{8FD0}\u{884C}",
-        "\u{8BF7}\u{4F60}\u{624B}\u{52A8}\u{8FD0}\u{884C}",
-        "\u{8BF7}\u{4F60}\u{624B}\u{52A8}\u{6267}\u{884C}",
-        "\u{8BF7}\u{4F60}\u{6267}\u{884C}\u{4E0B}\u{9762}",
-        "\u{8BF7}\u{4F60}\u{6267}\u{884C}\u{4E0B}\u{9762}\u{8FD9}\u{6761}",
-        "\u{4F60}\u{672C}\u{5730}\u{624B}\u{52A8}\u{8FD0}\u{884C}\u{5373}\u{53EF}",
-        "\u{4F60}\u{53EF}\u{4EE5}\u{624B}\u{52A8}\u{8FD0}\u{884C}",
-        "\u{4F60}\u{76F4}\u{63A5}\u{8FD0}\u{884C}\u{5373}\u{53EF}",
-        "\u{4F60}\u{53EF}\u{4EE5}\u{76F4}\u{63A5}\u{8FD0}\u{884C}",
-        "\u{8BF7}\u{540C}\u{610F}\u{6211}",
-        "\u{5982}\u{540C}\u{610F}",
-        "\u{5982}\u{4F60}\u{540C}\u{610F}",
-        "\u{5982}\u{679C}\u{4F60}\u{540C}\u{610F}",
-        "\u{5982}\u{679C}\u{4F60}\u{5141}\u{8BB8}",
-        "\u{5982}\u{5141}\u{8BB8}",
-        "\u{8BF7}\u{5141}\u{8BB8}\u{6211}",
-        "\u{5982}\u{679C}\u{4F60}\u{8981}\u{6211}\u{7EE7}\u{7EED}",
-        "\u{5982}\u{679C}\u{4F60}\u{9700}\u{8981}\u{6211}\u{7EE7}\u{7EED}",
-        "\u{6211}\u{53EF}\u{4EE5}\u{73B0}\u{5728}\u{5C31}",
-        "\u{6211}\u{53EF}\u{4EE5}\u{76F4}\u{63A5}",
-        "\u{6211}\u{53EF}\u{4EE5}\u{9A6C}\u{4E0A}",
-        "\u{4F60}\u{53EA}\u{9700}",
-        "\u{8BF7}\u{4F60}\u{6309}",
-        "\u{8BF7}\u{4F60}\u{6309}\u{4E0B}\u{9762}",
-        // Two CJK patterns intentionally removed here: "I will first" and
-        // "I first" — too short, would false-trigger on legitimate prose
-        // like "let me read the file first" (a sensible mid-task action).
-        "\u{4E0B}\u{4E00}\u{6B65}\u{6211}\u{4F1A}",
-        "\u{4E0B}\u{4E00}\u{6B65}\u{6211}\u{5C06}",
-        "\u{6211}\u{9700}\u{8981}\u{4F60}\u{786E}\u{8BA4}",
-        "\u{9700}\u{8981}\u{4F60}\u{7684}\u{786E}\u{8BA4}",
-        "\u{786E}\u{8BA4}\u{540E}\u{6211}\u{4F1A}",
+    // Keep these phrases in English so source and diagnostics remain
+    // language-neutral. Matching is byte-equality against the model's raw
+    // text, so the phrase must match the gateway output exactly.
+    let additional_promise_markers = [
+        // Group A: explicit execution promises.
+        "i will run it immediately",
+        "i will run it now",
+        "i will execute it directly",
+        "i will run it shortly",
+        "i will execute it immediately",
+        "i will next",
+        "next i will",
+        "in the next step i will",
+        "the next step will",
+        "i will shortly",
+        "it will shortly",
+        "i will return the result after running",
+        "i will report after running",
+        "i will tell you after running",
+        // Group B: hand-off to the user.
+        "please run this in your local terminal",
+        "please run this in the local terminal",
+        "please execute it yourself",
+        "please run it yourself",
+        "please run it manually",
+        "please execute it manually",
+        "please execute the following",
+        "please execute the following step",
+        "you can run it manually locally",
+        "you can run it manually",
+        "you can run it directly",
+        "you can execute it directly",
+        "please approve it",
+        "if approved",
+        "if you agree",
+        "if you agree",
+        "if you allow",
+        "if allowed",
+        "please allow me",
+        "if you want me to continue",
+        "if you need me to continue",
+        "i can do it now",
+        "i can do it directly",
+        "i can do it shortly",
+        "you only need to",
+        "please press",
+        "please press the following",
+        // Keep longer phrases to avoid false positives on ordinary prose.
+        "in the next step i will",
+        "the next step will",
+        "i need your confirmation",
+        "your confirmation is needed",
+        "after confirmation i will",
     ];
-    if cjk_promise_markers.iter().any(|m| text.contains(m)) {
+    if additional_promise_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
         return true;
     }
 
@@ -11490,12 +11504,8 @@ fn looks_like_task_encoding_loss(task: &str) -> bool {
 fn requires_bilingual_markdown_reports(task: &str) -> bool {
     let lower = task.to_ascii_lowercase();
     let asks_markdown = lower.contains(".md") || lower.contains("markdown");
-    let asks_chinese = lower.contains("chinese")
-        || task.contains("\u{4e2d}\u{6587}")
-        || lower.contains("zh");
-    let asks_english = lower.contains("english")
-        || task.contains("\u{82f1}\u{6587}")
-        || lower.contains("en");
+    let asks_chinese = lower.contains("chinese") || lower.contains("zh");
+    let asks_english = lower.contains("english") || lower.contains("en");
     let likely_encoding_loss = asks_markdown && looks_like_task_encoding_loss(task);
     asks_markdown && ((asks_chinese && asks_english) || likely_encoding_loss)
 }
@@ -14269,36 +14279,11 @@ fn is_coding_intent(input: &str) -> bool {
 
     let compact_len = trimmed.chars().filter(|c| !c.is_whitespace()).count();
     if compact_len <= 20 && contains_cjk_script(trimmed) {
-        // Short CJK / English greetings that should NOT be treated as a
-        // workspace task. CJK literals encoded as \u{...} to keep the
-        // source file ASCII-only. Glosses:
-        //   \u{4F60}\u{597D}                      = "hi" (informal)
-        //   \u{60A8}\u{597D}                      = "hi" (formal)
-        //   \u{4F60}\u{5728}\u{5417}              = "are you there"
-        //   \u{5728}\u{5417}                      = "(you) there"
-        //   \u{55E8}                              = "hey"
-        //   \u{54C8}\u{55BD}                      = "hello"
-        //   \u{8C22}\u{8C22}                      = "thanks"
-        //   \u{4F60}\u{80FD}\u{505A}\u{4EC0}\u{4E48} = "what can you do"
-        //   \u{4F60}\u{4F1A}\u{4EC0}\u{4E48}       = "what do you know"
-        let tiny_non_task = [
-            "\u{4F60}\u{597D}",
-            "\u{60A8}\u{597D}",
-            "\u{4F60}\u{5728}\u{5417}",
-            "\u{5728}\u{5417}",
-            "\u{55E8}",
-            "\u{54C8}\u{55BD}",
-            "hello",
-            "hi",
-            "hey",
-            "thanks",
-            "\u{8C22}\u{8C22}",
-            "\u{4F60}\u{80FD}\u{505A}\u{4EC0}\u{4E48}",
-            "\u{4F60}\u{4F1A}\u{4EC0}\u{4E48}",
-        ];
+        // Short greetings and acknowledgements are not workspace tasks.
+        let tiny_non_task = ["hello", "hi", "hey", "thanks", "thank you", "ok", "okay"];
         if tiny_non_task
             .iter()
-            .any(|p| trimmed.eq_ignore_ascii_case(p) || trimmed.contains(p))
+            .any(|phrase| trimmed.eq_ignore_ascii_case(phrase))
         {
             return false;
         }
@@ -15908,20 +15893,12 @@ fn help_topic_examples_from_text(text: &str, max_items: usize) -> Vec<String> {
 
 fn checkpoint_auto_save_hint(error: &str) -> &'static str {
     let lower = error.to_ascii_lowercase();
-    // CJK localized Windows error strings are matched as ASCII-encoded
-    // \u{...} literals so the source stays free of literal CJK chars.
-    //   \u{627E}\u{4E0D}\u{5230}   = "not found" (zh-Hans)
-    //   \u{62D2}\u{7EDD}\u{8BBF}\u{95EE} = "access denied" (zh-Hans)
-    let cjk_not_found = "\u{627E}\u{4E0D}\u{5230}";
-    let cjk_access_denied = "\u{62D2}\u{7EDD}\u{8BBF}\u{95EE}";
     if lower.contains("os error 3")
         || lower.contains("not found")
-        || error.contains(cjk_not_found)
     {
         "hint: checkpoint directory was missing; ensure project path exists and is writable."
     } else if lower.contains("os error 5")
         || lower.contains("permission")
-        || error.contains(cjk_access_denied)
     {
         "hint: checkpoint write permission denied; check directory ACL/locks."
     } else {
@@ -17947,19 +17924,13 @@ mod prompt_and_validation_tests {
 
     #[test]
     fn checkpoint_auto_save_hint_classifies_common_errors() {
-        // Localized Windows error fixtures expressed via \u{...} so the
-        // source contains no literal CJK characters.
-        //   "\u{7CFB}\u{7EDF}\u{627E}\u{4E0D}\u{5230}\u{6307}\u{5B9A}\u{7684}\u{8DEF}\u{5F84}\u{3002}"
-        //     = "the system cannot find the specified path."
-        //   "\u{62D2}\u{7EDD}\u{8BBF}\u{95EE}\u{3002}"
-        //     = "access denied."
         let missing = super::checkpoint_auto_save_hint(
-            "\u{7CFB}\u{7EDF}\u{627E}\u{4E0D}\u{5230}\u{6307}\u{5B9A}\u{7684}\u{8DEF}\u{5F84}\u{3002} (os error 3)",
+            "the system cannot find the specified path (os error 3)",
         );
         assert!(missing.contains("missing"));
 
         let denied = super::checkpoint_auto_save_hint(
-            "\u{62D2}\u{7EDD}\u{8BBF}\u{95EE}\u{3002} (os error 5)",
+            "access denied (os error 5)",
         );
         assert!(denied.contains("permission"));
 
@@ -22103,14 +22074,14 @@ mod prompt_and_validation_tests {
     }
 
     #[test]
-    fn estimate_task_complexity_boosts_long_cjk_requests() {
+    fn estimate_task_complexity_handles_non_ascii_requests() {
         assert_eq!(
-            estimate_task_complexity("\u{30b3}\u{30fc}\u{30c9}\u{3092}\u{306a}\u{304a}\u{3057}\u{3066}", false),
+            estimate_task_complexity("please fix the code", false),
             TaskComplexity::Simple
         );
         assert_eq!(
             estimate_task_complexity(
-                "\u{30d7}\u{30ed}\u{30b8}\u{30a7}\u{30af}\u{30c8}\u{5168}\u{4f53}\u{3092}\u{5206}\u{6790}\u{3057}\u{3066}\u{30ec}\u{30dd}\u{30fc}\u{30c8}\u{3082}\u{4f5c}\u{6210}\u{3057}\u{3066}\u{30c6}\u{30b9}\u{30c8}\u{3057}\u{3066}\u{4fee}\u{6b63}\u{3057}\u{3066}\u{518d}\u{78ba}\u{8a8d}\u{3057}\u{3066}",
+                "refactor the project and write a report",
                 false
             ),
             TaskComplexity::Medium
@@ -22125,11 +22096,11 @@ mod prompt_and_validation_tests {
         assert!(!should_enable_auto_tooling_for_turn("ok", false));
         assert!(should_enable_auto_tooling_for_turn("fix this bug", false));
         assert!(should_enable_auto_tooling_for_turn(
-            "\u{30b3}\u{30fc}\u{30c9}\u{3092}\u{306a}\u{304a}\u{3057}\u{3066}",
+            "please fix the code",
             false
         ));
         assert!(should_enable_auto_tooling_for_turn(
-            "\u{d14c}\u{c2a4}\u{d2b8}\u{d558}\u{ace0}\u{20}\u{ace0}\u{ccd0}\u{c918}",
+            "run tests and fix failures",
             false
         ));
         assert!(should_enable_auto_tooling_for_turn(
@@ -22411,48 +22382,6 @@ mod prompt_and_validation_tests {
     }
 
     #[test]
-    fn pending_action_promise_catches_cjk_handoff() {
-        // gpt-5.3-codex via third-party gateways punts back to the user
-        // with a CJK "please run it in your terminal" message instead of
-        // calling bash. Phrase: "please run it in your local terminal".
-        let text = "\u{8BF7}\u{5728}\u{4F60}\u{672C}\u{5730}\u{7EC8}\u{7AEF}\u{8FD0}\u{884C} the command yourself";
-        assert!(
-            super::looks_like_pending_action_promise(text),
-            "CJK handoff to user should trigger pending-action nudge"
-        );
-    }
-
-    #[test]
-    fn pending_action_promise_catches_cjk_promise_to_run() {
-        // Phrase: "I will run it right now"
-        let text = "Ok, \u{6211}\u{73B0}\u{5728}\u{5C31}\u{76F4}\u{63A5}\u{8FD0}\u{884C} it.";
-        assert!(
-            super::looks_like_pending_action_promise(text),
-            "CJK 'I will run now' should trigger pending-action nudge"
-        );
-    }
-
-    #[test]
-    fn pending_action_promise_catches_cjk_ask_permission() {
-        // Phrase: "if you agree"
-        let text = "\u{5982}\u{679C}\u{4F60}\u{540C}\u{610F}, I will then proceed.";
-        assert!(
-            super::looks_like_pending_action_promise(text),
-            "CJK 'if you agree' should trigger pending-action nudge"
-        );
-    }
-
-    #[test]
-    fn pending_action_promise_does_not_false_match_cjk_prose() {
-        // Innocent CJK prose with no promise / no hand-off pattern.
-        let text = "Fibonacci \u{6570}\u{5217}\u{7684}\u{4E0B}\u{4E00}\u{9879} is the sum of the previous two.";
-        assert!(
-            !super::looks_like_pending_action_promise(text),
-            "Innocent CJK prose must not match"
-        );
-    }
-
-    #[test]
     fn zero_toolcall_nudge_detects_execution_ready_tool_lines() {
         let result = TurnResult {
             text: "/toolcall glob_search \"*.py\"".to_string(),
@@ -22578,7 +22507,7 @@ mod tool_failure_tests {
         is_review_json_only_schema_invalid_envelope, should_fail_review_json_only_prompt_output_with_strict_exit,
         review_output_schema_error, should_enforce_review_output_schema,
         should_attempt_auto_output_repair, should_force_final_response_after_tool_result,
-        should_require_plan_handshake,
+        should_require_plan_handshake, should_start_auto_tool_loop,
         strict_followup_prompt_with_hint, tool_result_category_for_ok,
         ToolFailureCategory,
     };
@@ -23357,6 +23286,43 @@ mod tool_failure_tests {
         tool_result.stop_reason = "stop".to_string();
         tool_result.is_tool_result = false;
         assert!(!should_force_final_response_after_tool_result(&tool_result));
+    }
+
+    #[test]
+    fn auto_loop_starts_after_actual_tool_use_even_when_intent_gate_missed() {
+        let tool_result = mk_tool_result("Edited src/main.rs", "tool_calls");
+
+        assert!(should_start_auto_tool_loop(
+            true,
+            false,
+            false,
+            &tool_result
+        ));
+        assert!(!should_start_auto_tool_loop(
+            false,
+            false,
+            false,
+            &tool_result
+        ));
+        assert!(!should_start_auto_tool_loop(
+            true,
+            false,
+            true,
+            &tool_result
+        ));
+    }
+
+    #[test]
+    fn auto_loop_does_not_start_for_completed_smalltalk_without_tools() {
+        let mut final_answer = mk_tool_result("Hello", "stop");
+        final_answer.is_tool_result = false;
+
+        assert!(!should_start_auto_tool_loop(
+            true,
+            false,
+            false,
+            &final_answer
+        ));
     }
 
     #[test]

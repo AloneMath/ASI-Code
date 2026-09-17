@@ -1411,7 +1411,6 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE).
 
 See: [GITHUB_REPO_COPY_BILINGUAL.md](GITHUB_REPO_COPY_BILINGUAL.md)
 
-## CLI x API Collaboration (ZH)
+## CLI x API Collaboration
 
-- 协同机制校准与升级蓝图（中文）：[CLI_API_COLLABORATION_ZH.md](CLI_API_COLLABORATION_ZH.md)
 - Collaboration reality and upgrade blueprint (English): [CLI_API_COLLABORATION_EN.md](CLI_API_COLLABORATION_EN.md)

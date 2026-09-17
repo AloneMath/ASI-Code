@@ -3,6 +3,7 @@ use crate::config::{default_model, resolve_model_alias};
 use crate::cost;
 use crate::meta::DEFAULT_SYSTEM_PROMPT;
 use crate::permissions;
+use crate::plugin;
 use crate::provider::{
     tool_call_to_legacy_args, ChatMessage, ChatProvider, CompletionResult, ProviderClient,
     StreamingResult, ToolCallSpec,
@@ -10,7 +11,6 @@ use crate::provider::{
 use crate::sandbox::{SandboxPreflightContext, SandboxStrategy};
 use crate::security;
 use crate::tools::{DefaultToolRunner, ToolRunner};
-use crate::plugin;
 use serde_json::json;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -274,7 +274,10 @@ impl Runtime {
                     let claude_path = root.join(filename);
                     if let Some(part) = Self::read_doc_context(&claude_path, filename) {
                         context_parts.push(part);
-                        sources.push(Self::normalize_path_for_source(&claude_path, workspace_root));
+                        sources.push(Self::normalize_path_for_source(
+                            &claude_path,
+                            workspace_root,
+                        ));
                         loaded_any_claude = true;
                     }
                 }
@@ -419,7 +422,10 @@ impl Runtime {
         let system_prompt = if project_context_bundle.text.is_empty() {
             DEFAULT_SYSTEM_PROMPT.to_string()
         } else {
-            format!("{}\n\n{}", DEFAULT_SYSTEM_PROMPT, project_context_bundle.text)
+            format!(
+                "{}\n\n{}",
+                DEFAULT_SYSTEM_PROMPT, project_context_bundle.text
+            )
         };
 
         let rt = Self {
@@ -483,10 +489,19 @@ impl Runtime {
         let model = model.trim().to_ascii_lowercase();
         let model_is_deepseek_reasoner = model.contains("reasoner") && model.contains("deepseek");
 
-        if provider == "deepseek" || model_is_deepseek_reasoner {
+        if model_is_deepseek_reasoner {
             return ModelCapabilities {
                 native_tool_calling_default: false,
                 native_tool_calling_supported: false,
+                recommended_max_output_tokens: 4096,
+            };
+        }
+
+        if provider == "deepseek" {
+            let native = model.contains("deepseek-v4");
+            return ModelCapabilities {
+                native_tool_calling_default: native,
+                native_tool_calling_supported: native,
                 recommended_max_output_tokens: 4096,
             };
         }
@@ -573,7 +588,8 @@ impl Runtime {
         }
 
         let input_tokens = estimate_tokens(user_text);
-        self.messages.push(ChatMessage::text("user".to_string(), user_text.to_string()));
+        self.messages
+            .push(ChatMessage::text("user".to_string(), user_text.to_string()));
 
         let thinking = if self.extended_thinking {
             Some(generate_thinking(user_text))
@@ -594,7 +610,10 @@ impl Runtime {
     /// native protocol expects the assistant to be re-invoked with no new
     /// user message (the model continues from its own tool results).
     pub fn last_message_is_tool_result(&self) -> bool {
-        self.messages.last().map(|m| m.role == "tool").unwrap_or(false)
+        self.messages
+            .last()
+            .map(|m| m.role == "tool")
+            .unwrap_or(false)
     }
 
     /// Continue the conversation after native tool results WITHOUT pushing a
@@ -726,16 +745,8 @@ impl Runtime {
         let parsed = serde_json::from_str::<HookFile>(&text).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for row in parsed.handlers.unwrap_or_default() {
-            let event = row
-                .event
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let script = row
-                .script
-                .unwrap_or_default()
-                .trim()
-                .to_string();
+            let event = row.event.unwrap_or_default().trim().to_string();
+            let script = row.script.unwrap_or_default().trim().to_string();
             if event.is_empty() || script.is_empty() {
                 continue;
             }
@@ -746,11 +757,19 @@ impl Runtime {
                 json_protocol: row.json_protocol,
                 tool_prefix: row.tool_prefix.and_then(|v| {
                     let t = v.trim().to_string();
-                    if t.is_empty() { None } else { Some(t) }
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t)
+                    }
                 }),
                 permission_mode: row.permission_mode.and_then(|v| {
                     let t = v.trim().to_string();
-                    if t.is_empty() { None } else { Some(t) }
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t)
+                    }
                 }),
                 failure_policy: row
                     .failure_policy
@@ -842,15 +861,20 @@ impl Runtime {
             "invalid token",
             "forbidden",
         ]
-            .iter()
-            .any(|needle| lower.contains(needle))
+        .iter()
+        .any(|needle| lower.contains(needle))
         {
             return ProviderErrorKind::Auth;
         }
 
-        if ["quota", "insufficient_quota", "billing", "exceeded your current quota"]
-            .iter()
-            .any(|needle| lower.contains(needle))
+        if [
+            "quota",
+            "insufficient_quota",
+            "billing",
+            "exceeded your current quota",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
         {
             return ProviderErrorKind::Quota;
         }
@@ -910,7 +934,13 @@ impl Runtime {
         self.last_stop_reason_raw = Some(stop_reason.to_string());
         self.last_stop_reason_alias = Some(Self::stop_reason_alias(stop_reason).to_string());
         let hooks = Self::load_hook_config();
-        let _ = run_event_hooks(&hooks, "Stop", "runtime", stop_reason, &self.permission_mode);
+        let _ = run_event_hooks(
+            &hooks,
+            "Stop",
+            "runtime",
+            stop_reason,
+            &self.permission_mode,
+        );
     }
 
     pub fn emit_hook_event_with_mode(
@@ -939,10 +969,7 @@ impl Runtime {
         let mut fallback_note: Option<String> = None;
 
         loop {
-            match self
-                .client
-                .complete_streaming_dyn(&self.messages, on_delta)
-            {
+            match self.client.complete_streaming_dyn(&self.messages, on_delta) {
                 Ok(streaming) => return Ok((streaming, fallback_note)),
                 Err(e) => {
                     if retry_attempts < retry_limit && Self::is_retryable_provider_error(&e) {
@@ -1078,8 +1105,12 @@ impl Runtime {
         let max_rounds = Self::length_continuation_max_rounds();
 
         while stop_reason == "length" && rounds < max_rounds {
-            self.messages.push(ChatMessage::text("assistant".to_string(), combined.clone()));
-            self.messages.push(ChatMessage::text("user".to_string(), LENGTH_CONTINUATION_PROMPT.to_string()));
+            self.messages
+                .push(ChatMessage::text("assistant".to_string(), combined.clone()));
+            self.messages.push(ChatMessage::text(
+                "user".to_string(),
+                LENGTH_CONTINUATION_PROMPT.to_string(),
+            ));
             let (next, _) = self.complete_streaming_with_resilience(on_delta)?;
             if !next.text.is_empty() {
                 combined.push_str(&next.text);
@@ -1120,10 +1151,8 @@ impl Runtime {
                 self.cumulative_cost_usd += turn_cost;
 
                 if !completion_text.is_empty() && completion.tool_calls.is_empty() {
-                    self.messages.push(ChatMessage::text(
-                        "assistant",
-                        completion_text.clone(),
-                    ));
+                    self.messages
+                        .push(ChatMessage::text("assistant", completion_text.clone()));
                 }
 
                 if completion.tool_calls.is_empty() {
@@ -1271,10 +1300,8 @@ impl Runtime {
                         &self.permission_mode,
                     ) {
                         if !outcome.allow {
-                            permission_hook_denied_reason = Some(format!(
-                                "hook PermissionRequest denied: {}",
-                                outcome.reason
-                            ));
+                            permission_hook_denied_reason =
+                                Some(format!("hook PermissionRequest denied: {}", outcome.reason));
                             break;
                         }
                     }
@@ -1386,9 +1413,14 @@ impl Runtime {
                 // the previous flattening (fake assistant text + results as
                 // a user message) pushed them off-distribution and caused
                 // erratic early stops and invented pseudo-XML call formats.
-                self.messages.push(ChatMessage::assistant_with_tool_calls(
+                self.messages.push(ChatMessage::assistant_with_tool_calls_and_reasoning(
                     completion_text.clone(),
-                    completion.tool_calls.iter().map(ToolCallSpec::from_call).collect(),
+                    completion
+                        .tool_calls
+                        .iter()
+                        .map(ToolCallSpec::from_call)
+                        .collect(),
+                    completion.reasoning_content.clone(),
                 ));
                 for nr in &native_results {
                     self.messages.push(ChatMessage::tool_result(
@@ -1473,7 +1505,8 @@ impl Runtime {
                 let turn_cost_usd =
                     cost::estimate_cost_usd(&self.model, input_tokens, output_tokens);
                 self.cumulative_cost_usd += turn_cost_usd;
-                self.messages.push(ChatMessage::text("assistant".to_string(), text.clone()));
+                self.messages
+                    .push(ChatMessage::text("assistant".to_string(), text.clone()));
 
                 let mut display_text = text;
                 if let Some(note) = fallback_note {
@@ -1546,13 +1579,7 @@ impl Runtime {
         let deny_rules = self.effective_deny_rules();
         let additional_dirs = self.effective_additional_directories();
         let hooks = Self::load_hook_config();
-        for outcome in run_event_hooks(
-            &hooks,
-            "PreToolUse",
-            &name,
-            &args,
-            &self.permission_mode,
-        ) {
+        for outcome in run_event_hooks(&hooks, "PreToolUse", &name, &args, &self.permission_mode) {
             if !outcome.allow {
                 let reason = format!("hook PreToolUse denied: {}", outcome.reason);
                 let _ = audit::log_permission_decision(
@@ -1765,21 +1792,19 @@ impl Runtime {
         self.consume_next_permissions();
 
         let r = self.tool_runner.run(&name, &args);
-        let _ = run_event_hooks(
-            &hooks,
-            "PostToolUse",
-            &name,
-            &args,
-            &self.permission_mode,
-        );
+        let _ = run_event_hooks(&hooks, "PostToolUse", &name, &args, &self.permission_mode);
         let txt = format!(
             "[tool:{}:{}]\n{}",
             name,
             if r.ok { "ok" } else { "error" },
             r.output
         );
-        self.messages.push(ChatMessage::text("user".to_string(), user_text.to_string()));
-        self.messages.push(ChatMessage::text("assistant".to_string(), compact_tool_result_for_history(&name, &txt)));
+        self.messages
+            .push(ChatMessage::text("user".to_string(), user_text.to_string()));
+        self.messages.push(ChatMessage::text(
+            "assistant".to_string(),
+            compact_tool_result_for_history(&name, &txt),
+        ));
         self.record_stop_reason("tool_result");
         TurnResult {
             text: txt,
@@ -1868,8 +1893,14 @@ impl Runtime {
             }
 
             if outcome.stop_reason == "tool_result" {
-                self.messages.push(ChatMessage::text("user".to_string(), outcome.command.clone()));
-                self.messages.push(ChatMessage::text("assistant".to_string(), compact_tool_result_for_history(&outcome.tool_name, &outcome.text)));
+                self.messages.push(ChatMessage::text(
+                    "user".to_string(),
+                    outcome.command.clone(),
+                ));
+                self.messages.push(ChatMessage::text(
+                    "assistant".to_string(),
+                    compact_tool_result_for_history(&outcome.tool_name, &outcome.text),
+                ));
             }
 
             results.push(TurnResult {
@@ -2025,7 +2056,11 @@ impl Runtime {
         for (i, m) in drop_region.iter().enumerate() {
             let snippet = if m.content.chars().count() > 600 {
                 let head: String = m.content.chars().take(600).collect();
-                format!("{}…[truncated {} chars]", head, m.content.chars().count() - 600)
+                format!(
+                    "{}…[truncated {} chars]",
+                    head,
+                    m.content.chars().count() - 600
+                )
             } else {
                 m.content.clone()
             };
@@ -2153,11 +2188,15 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
     /// model turn sees it in context. Does not touch token counters —
     /// those are updated on the next `run_turn_streaming` call.
     pub fn push_user_message(&mut self, content: &str) {
-        self.messages.push(ChatMessage::text("user".to_string(), content.to_string()));
+        self.messages
+            .push(ChatMessage::text("user".to_string(), content.to_string()));
     }
 
     pub fn clear(&mut self) {
-        self.messages = vec![ChatMessage::text("system".to_string(), DEFAULT_SYSTEM_PROMPT.to_string())];
+        self.messages = vec![ChatMessage::text(
+            "system".to_string(),
+            DEFAULT_SYSTEM_PROMPT.to_string(),
+        )];
         self.cumulative_input_tokens = 0;
         self.cumulative_output_tokens = 0;
         self.cumulative_cost_usd = 0.0;
@@ -2181,12 +2220,19 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
         self.provider = provider.clone();
         self.model = model.clone();
         self.client = Box::new(ProviderClient::new(provider, model));
+        // A resumed session may have been created with a different model or
+        // provider. Recompute the native-tool capability instead of carrying
+        // the previous session's boolean into the new protocol.
+        self.native_tool_calling = Self::default_native_tool_calling(&self.provider, &self.model);
         self.native_tool_auto_disabled_reason = None;
         self.last_provider_error_kind = None;
         self.last_provider_error_message = None;
         self.last_stop_reason_raw = None;
         self.last_stop_reason_alias = None;
-        self.messages = vec![ChatMessage::text("system".to_string(), DEFAULT_SYSTEM_PROMPT.to_string())];
+        self.messages = vec![ChatMessage::text(
+            "system".to_string(),
+            DEFAULT_SYSTEM_PROMPT.to_string(),
+        )];
         for v in loaded {
             // Prefer full-fidelity deserialization so native tool_calls /
             // tool role messages saved by newer builds round-trip intact.
@@ -2227,7 +2273,10 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
     pub fn as_json_messages(&self) -> Vec<serde_json::Value> {
         self.messages
             .iter()
-            .map(|m| serde_json::to_value(m).unwrap_or_else(|_| json!({"role": m.role, "content": m.content})))
+            .map(|m| {
+                serde_json::to_value(m)
+                    .unwrap_or_else(|_| json!({"role": m.role, "content": m.content}))
+            })
             .collect()
     }
 
@@ -2320,6 +2369,7 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
         self.provider = provider.clone();
         self.model = model.clone();
         self.client = Box::new(ProviderClient::new(provider, model));
+        self.native_tool_calling = Self::default_native_tool_calling(&self.provider, &self.model);
         self.native_tool_auto_disabled_reason = None;
         self.last_provider_error_kind = None;
         self.last_provider_error_message = None;
@@ -2341,7 +2391,12 @@ fn is_interactive_permission_mode(mode: &str) -> bool {
     )
 }
 
-pub fn collect_hook_diagnostics(event: &str, tool: &str, args: &str, mode: &str) -> Vec<HookDiagnostic> {
+pub fn collect_hook_diagnostics(
+    event: &str,
+    tool: &str,
+    args: &str,
+    mode: &str,
+) -> Vec<HookDiagnostic> {
     let hooks = Runtime::load_hook_config();
     let (_, diagnostics) = run_event_hooks_with_diagnostics(&hooks, event, tool, args, mode);
     diagnostics
@@ -3051,7 +3106,9 @@ fn parse_named_function_args(inner: &str) -> Option<String> {
             return None;
         }
         let value_raw = trimmed[eq + 1..].trim();
-        let value = normalize_arg_token(value_raw).replace('\\', "\\\\").replace('"', "\\\"");
+        let value = normalize_arg_token(value_raw)
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         normalized.push(format!(r#"{}="{}""#, key, value));
     }
     Some(normalized.join(" "))
@@ -3352,16 +3409,8 @@ fn deny_reason(
 
     let lvl = level(mode);
     let required = match tool {
-        "read_file"
-        | "glob_search"
-        | "grep_search"
-        | "web_search"
-        | "web_fetch"
-        | "screenshot"
-        | "find_window"
-        | "read_screen_text"
-        | "probe_diff"
-        | "video_keyframes" => 0,
+        "read_file" | "glob_search" | "grep_search" | "web_search" | "web_fetch" | "screenshot"
+        | "find_window" | "read_screen_text" | "probe_diff" | "video_keyframes" => 0,
         "write_file"
         | "edit_file"
         | "bash"
@@ -3431,7 +3480,12 @@ fn run_hook(
         .stderr(Stdio::piped());
     if json_protocol {
         let plugin_names = plugin_ctx
-            .map(|p| p.names_csv.split(',').map(|s| s.to_string()).collect::<Vec<_>>())
+            .map(|p| {
+                p.names_csv
+                    .split(',')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let args_details = build_hook_args_details(event, tool, args);
         let payload = json!({
@@ -3570,11 +3624,7 @@ fn hook_handler_matches(handler: &HookHandlerConfig, event: &str, tool: &str, mo
     true
 }
 
-fn plugin_hook_matches(
-    hook: &PluginHookExecution,
-    tool: &str,
-    mode: &str,
-) -> bool {
+fn plugin_hook_matches(hook: &PluginHookExecution, tool: &str, mode: &str) -> bool {
     if let Some(prefix) = hook.tool_prefix.as_deref() {
         let p = prefix.trim();
         if !p.is_empty() && !tool.starts_with(p) {
@@ -3602,7 +3652,10 @@ fn build_plugin_event_hooks(event: &str) -> Vec<PluginHookExecution> {
             json_protocol: hook.json_protocol,
             tool_prefix: hook.tool_prefix,
             permission_mode: hook.permission_mode,
-            failure_policy: hook.failure_policy.as_deref().and_then(parse_hook_failure_policy),
+            failure_policy: hook
+                .failure_policy
+                .as_deref()
+                .and_then(parse_hook_failure_policy),
         });
     }
     rows
@@ -3914,29 +3967,18 @@ fn generate_thinking(user_text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        apply_hook_failure_policy, auto_review_decision, build_hook_args_details,
+        build_plugin_event_hooks, check_interactive_approval_rules, hook_event_matches,
+        hook_handler_matches, interactive_approval_rule, is_interactive_permission_mode,
+        normalize_tool_args, parse_auto_review_mode, parse_auto_review_threshold,
+        parse_hook_failure_policy, parse_hook_json_outcome, parse_json_tool_invocation,
+        plugin_hook_matches, score_auto_review_risk, tool_requires_user_confirmation,
+        HookFailurePolicy, HookHandlerConfig, PluginHookExecution, ProviderErrorKind,
+        Runtime as RuntimeType, ToolApprovalDecision,
+    };
     use crate::provider::{ChatMessage, ChatProvider, CompletionResult, StreamingResult};
     use crate::runtime::Runtime;
-    use super::{
-        check_interactive_approval_rules, interactive_approval_rule,
-        auto_review_decision,
-        build_hook_args_details,
-        build_plugin_event_hooks, hook_event_matches, hook_handler_matches, is_interactive_permission_mode,
-        normalize_tool_args, parse_json_tool_invocation,
-        parse_hook_failure_policy,
-        parse_auto_review_mode,
-        parse_auto_review_threshold,
-        plugin_hook_matches,
-        parse_hook_json_outcome,
-        apply_hook_failure_policy,
-        score_auto_review_risk,
-        tool_requires_user_confirmation,
-        HookFailurePolicy,
-        HookHandlerConfig,
-        PluginHookExecution,
-        ProviderErrorKind,
-        Runtime as RuntimeType,
-        ToolApprovalDecision,
-    };
     use std::collections::VecDeque;
     use std::fs;
     use std::path::Path;
@@ -4008,6 +4050,7 @@ mod tests {
                     text: "mock-default-with-tools".to_string(),
                     tool_calls: Vec::new(),
                     stop_reason: "completed".to_string(),
+                    reasoning_content: String::new(),
                 })
             })
         }
@@ -4189,10 +4232,7 @@ mod tests {
         assert!(ctx.text.contains("CLAUDE.md"));
         assert!(ctx.text.contains("rule=claude-only"));
         assert!(!ctx.text.contains("should_not_be_loaded"));
-        assert!(ctx
-            .sources
-            .iter()
-            .any(|s| s.ends_with("CLAUDE.md")));
+        assert!(ctx.sources.iter().any(|s| s.ends_with("CLAUDE.md")));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -4219,10 +4259,16 @@ mod tests {
         let dir = make_temp_dir("asi_runtime_ctx_fallback_override");
         write_text(&dir.join("README.md"), "# readme\nbase-readme");
         write_text(&dir.join("README.local.md"), "# readme-local\nlocal-readme");
-        write_text(&dir.join("README.override.md"), "# readme-override\noverride-readme");
+        write_text(
+            &dir.join("README.override.md"),
+            "# readme-override\noverride-readme",
+        );
         write_text(&dir.join("AGENTS.md"), "# agents\nbase-agents");
         write_text(&dir.join("AGENTS.local.md"), "# agents-local\nlocal-agents");
-        write_text(&dir.join("AGENTS.override.md"), "# agents-override\noverride-agents");
+        write_text(
+            &dir.join("AGENTS.override.md"),
+            "# agents-override\noverride-agents",
+        );
 
         let ctx = Runtime::load_project_context_with_mode(&dir, true);
         assert!(ctx.text.contains("README.override.md"));
@@ -4435,13 +4481,13 @@ mod tests {
 
     #[test]
     fn default_native_tool_calling_disables_deepseek_reasoner_family() {
-        assert!(!RuntimeType::default_native_tool_calling(
+        assert!(RuntimeType::default_native_tool_calling(
             "deepseek",
             "deepseek-v4-pro"
         ));
         assert!(!RuntimeType::default_native_tool_calling(
             "deepseek",
-            "deepseek-v4-pro"
+            "deepseek-reasoner"
         ));
         assert!(RuntimeType::default_native_tool_calling(
             "openai",
@@ -4465,8 +4511,8 @@ mod tests {
     #[test]
     fn capabilities_for_provider_model_matches_expected_defaults() {
         let deepseek = RuntimeType::capabilities_for("deepseek", "deepseek-v4-pro");
-        assert!(!deepseek.native_tool_calling_default);
-        assert!(!deepseek.native_tool_calling_supported);
+        assert!(deepseek.native_tool_calling_default);
+        assert!(deepseek.native_tool_calling_supported);
         assert_eq!(deepseek.recommended_max_output_tokens, 4096);
 
         let openai = RuntimeType::capabilities_for("openai", "gpt-5.3-codex");
@@ -4484,8 +4530,8 @@ mod tests {
             8,
         );
         let line = rt.status_provider_runtime_line();
-        assert!(line.contains("native=false"));
-        assert!(line.contains("supported=false"));
+        assert!(line.contains("native=true"));
+        assert!(line.contains("supported=true"));
         assert!(line.contains("recommended_max_output_tokens=4096"));
     }
 
@@ -4498,7 +4544,8 @@ mod tests {
             10,
         );
         for i in 0..8usize {
-            rt.messages.push(ChatMessage::text("user".to_string(), format!("msg {}", i)));
+            rt.messages
+                .push(ChatMessage::text("user".to_string(), format!("msg {}", i)));
         }
         // 8 user turns of 10 = 80%, threshold at 0.80 -> ceil(8.0) = 8 -> fires
         assert!(rt.auto_compact_recommendation_by_turns(0.80).is_some());
@@ -4517,7 +4564,8 @@ mod tests {
             "workspace-write".to_string(),
             0,
         );
-        rt.messages.push(ChatMessage::text("user".to_string(), "x".to_string()));
+        rt.messages
+            .push(ChatMessage::text("user".to_string(), "x".to_string()));
         assert!(rt.auto_compact_recommendation_by_turns(0.5).is_none());
     }
 
@@ -4547,8 +4595,8 @@ mod tests {
 
     #[test]
     fn parse_hook_json_outcome_reads_allow_and_reason() {
-        let parsed = parse_hook_json_outcome(r#"{"allow":true,"reason":"ok"}"#)
-            .expect("valid hook json");
+        let parsed =
+            parse_hook_json_outcome(r#"{"allow":true,"reason":"ok"}"#).expect("valid hook json");
         assert!(parsed.allow);
         assert_eq!(parsed.reason, "ok");
         assert!(!parsed.is_error);
@@ -4556,8 +4604,8 @@ mod tests {
 
     #[test]
     fn parse_hook_json_outcome_defaults_reason_when_missing() {
-        let parsed = parse_hook_json_outcome(r#"{"allow":false}"#)
-            .expect("valid hook json without reason");
+        let parsed =
+            parse_hook_json_outcome(r#"{"allow":false}"#).expect("valid hook json without reason");
         assert!(!parsed.allow);
         assert_eq!(parsed.reason, "denied");
         assert!(parsed.is_error);
@@ -4723,10 +4771,9 @@ mod tests {
 }"#,
         );
 
-        let handlers = Runtime::load_hook_handlers_from_file(
-            path.to_str().expect("utf8 path for test"),
-        )
-        .expect("parse hook handlers");
+        let handlers =
+            Runtime::load_hook_handlers_from_file(path.to_str().expect("utf8 path for test"))
+                .expect("parse hook handlers");
 
         assert_eq!(handlers.len(), 2);
         assert_eq!(handlers[0].event, "SessionStart");
@@ -4754,11 +4801,9 @@ mod tests {
         let path = dir.join("hooks.json");
         write_text(&path, "{invalid-json");
 
-        let err = Runtime::load_hook_handlers_from_file(
-            path.to_str().expect("utf8 path for test"),
-        )
-        .err()
-        .expect("expected parse error");
+        let err = Runtime::load_hook_handlers_from_file(path.to_str().expect("utf8 path for test"))
+            .err()
+            .expect("expected parse error");
         assert!(!err.trim().is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -4774,28 +4819,18 @@ mod tests {
     #[test]
     fn build_hook_args_details_structures_stop_and_subagent_stop() {
         let stop = build_hook_args_details("Stop", "runtime", "max_turns_reached");
-        assert_eq!(
-            stop.get("kind").and_then(|v| v.as_str()),
-            Some("stop")
-        );
+        assert_eq!(stop.get("kind").and_then(|v| v.as_str()), Some("stop"));
         assert_eq!(
             stop.get("stop_reason").and_then(|v| v.as_str()),
             Some("max_turns_reached")
         );
 
-        let sub = build_hook_args_details(
-            "SubagentStop",
-            "subagent",
-            "id=sa-9 status=done",
-        );
+        let sub = build_hook_args_details("SubagentStop", "subagent", "id=sa-9 status=done");
         assert_eq!(
             sub.get("kind").and_then(|v| v.as_str()),
             Some("subagent_stop")
         );
-        assert_eq!(
-            sub.get("tool").and_then(|v| v.as_str()),
-            Some("subagent")
-        );
+        assert_eq!(sub.get("tool").and_then(|v| v.as_str()), Some("subagent"));
         assert_eq!(
             sub.get("fields")
                 .and_then(|v| v.get("id"))
@@ -4831,17 +4866,15 @@ mod tests {
             prompt.get("prompt").and_then(|v| v.as_str()),
             Some("hello world")
         );
-        assert_eq!(
-            prompt.get("prompt_len").and_then(|v| v.as_u64()),
-            Some(11)
-        );
+        assert_eq!(prompt.get("prompt_len").and_then(|v| v.as_u64()), Some(11));
     }
 
     #[test]
     fn collect_hook_diagnostics_returns_empty_when_hooks_disabled() {
         let old = std::env::var("ASI_HOOKS_ENABLED").ok();
         std::env::set_var("ASI_HOOKS_ENABLED", "false");
-        let rows = super::collect_hook_diagnostics("SessionStart", "runtime", "probe", "on-request");
+        let rows =
+            super::collect_hook_diagnostics("SessionStart", "runtime", "probe", "on-request");
         assert!(rows.is_empty());
         if let Some(v) = old {
             std::env::set_var("ASI_HOOKS_ENABLED", v);

@@ -20,8 +20,7 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
 
     let single_line_wrapper_normalized = normalize_single_line_toolcall_wrapper(text);
     let pseudo_xml_normalized = normalize_pseudo_xml_toolcall_markers(&single_line_wrapper_normalized);
-    let cjk_bracket_normalized = normalize_cjk_bracket_call_markers(&pseudo_xml_normalized);
-    let inline_calling_normalized = normalize_inline_angle_calling_blocks(&cjk_bracket_normalized);
+    let inline_calling_normalized = normalize_inline_angle_calling_blocks(&pseudo_xml_normalized);
     let calling_normalized = normalize_calling_markdown_blocks(&inline_calling_normalized);
     let dsml_normalized = normalize_dsml_fenced_tags(&calling_normalized);
     // Convert DeepSeek-v4-Pro multi-line `<TAG ... content="<<<CONTENT\n...
@@ -471,92 +470,6 @@ fn is_no_space_pseudo_toolcall_marker(line: &str) -> bool {
 /// args or a single backtick-wrapped JSON / quoted-args string. The closing
 /// line `</**Calling**>` is pure noise. We rewrite the opener to a
 /// canonical `/toolcall TOOL ARGS` line and drop the closer.
-/// Recognize the CJK descriptive call-marker shape DeepSeek v4 Pro emits
-/// when speaking Chinese. The model writes things like:
-///
-///     [\u{8C03}\u{7528} bash] {"command": "Start-Process notepad"}
-///     [\u{8C03}\u{7528} type_text] {"text": "AI is writing this"}
-///
-/// where `\u{8C03}\u{7528}` is the CJK verb meaning "to call / invoke".
-/// The model thinks this is a tool-call format because it visually mirrors
-/// our `**Calling:** \`tool\`` English form. Without rewriting, the runtime
-/// treats the line as inert prose and the tool is never executed —
-/// observed in the wild as "model claimed to type the text, but Notepad
-/// stays empty".
-///
-/// We rewrite each matching line into `/toolcall TOOL ARGS` so the rest of
-/// the pipeline picks it up. The tool name must already be in our known
-/// canonical list — anything else is left untouched.
-fn normalize_cjk_bracket_call_markers(text: &str) -> String {
-    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
-    for line in text.lines() {
-        if let Some(rewritten) = try_rewrite_cjk_bracket_call(line.trim()) {
-            out.push(rewritten);
-        } else {
-            out.push(line.to_string());
-        }
-    }
-    out.join("\n")
-}
-
-fn try_rewrite_cjk_bracket_call(trimmed: &str) -> Option<String> {
-    // The CJK marker is "\u{8C03}\u{7528}" — must be inside square brackets
-    // or appear as the first token. We accept four common shapes:
-    //   [\u{8C03}\u{7528} TOOL] ARGS
-    //   [\u{8C03}\u{7528}: TOOL] ARGS
-    //   \u{8C03}\u{7528} TOOL: ARGS
-    //   \u{8C03}\u{7528} TOOL ARGS
-    let cjk_marker = "\u{8C03}\u{7528}";
-
-    // Branch A: bracketed form `[<marker> TOOL] ARGS`
-    if let Some(after_lb) = trimmed.strip_prefix('[') {
-        if let Some(after_mark) = after_lb.strip_prefix(cjk_marker) {
-            let inner = after_mark
-                .trim_start_matches(':')
-                .trim_start_matches(char::is_whitespace);
-            if let Some(rb_pos) = inner.find(']') {
-                let tool_raw = inner[..rb_pos].trim();
-                let after_rb = inner[rb_pos + 1..].trim_start();
-                if let Some(out) = build_toolcall_line(tool_raw, after_rb) {
-                    return Some(out);
-                }
-            }
-        }
-    }
-
-    // Branch B: bare form `<marker> TOOL: ARGS` or `<marker> TOOL ARGS`.
-    // Only fire when the line starts with the marker, to avoid matching
-    // prose that just happens to contain the word.
-    if let Some(after_mark) = trimmed.strip_prefix(cjk_marker) {
-        let rest = after_mark.trim_start();
-        // Split off the first whitespace-delimited token as the tool name.
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let tool_raw = parts.next().unwrap_or("").trim_end_matches(':').trim();
-        let after_tool = parts
-            .next()
-            .map(|s| s.trim_start_matches(':').trim_start())
-            .unwrap_or("");
-        if let Some(out) = build_toolcall_line(tool_raw, after_tool) {
-            return Some(out);
-        }
-    }
-
-    None
-}
-
-fn build_toolcall_line(tool_raw: &str, args: &str) -> Option<String> {
-    let normalized = normalize_tag_tool_name(&tool_raw.to_ascii_lowercase());
-    if !is_known_tool_name(&normalized) {
-        return None;
-    }
-    let args = args.trim();
-    if args.is_empty() {
-        Some(format!("/toolcall {}", normalized))
-    } else {
-        Some(format!("/toolcall {} {}", normalized, args))
-    }
-}
-
 fn normalize_inline_angle_calling_blocks(text: &str) -> String {
     let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
     for line in text.lines() {
@@ -3902,26 +3815,6 @@ mod tests {
         assert_eq!(calls[1].name, "screenshot");
     }
 
-    // Regression: when speaking Chinese, DeepSeek emits descriptive lines
-    // like `[\u{8C03}\u{7528} type_text] {"text":"..."}` ("[Call type_text]
-    // {...}") thinking that's a tool-call format. Without rewriting, the
-    // line is inert prose and the tool never fires — observed in the wild
-    // as "model claims to type the text but Notepad stays empty".
-    #[test]
-    fn promotes_cjk_bracket_call_marker_for_type_text() {
-        // The literal Chinese is "[\u{8C03}\u{7528} type_text]" =
-        // "[call type_text]". Source kept ASCII via escapes per project rule.
-        let text = "[\u{8C03}\u{7528} type_text] {\"text\":\"AI is writing this\"}";
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1, "expected 1 call, got {:?}", calls);
-        assert_eq!(calls[0].name, "type_text");
-        assert!(
-            calls[0].args.contains("AI is writing this"),
-            "args should carry the text: {}",
-            calls[0].args
-        );
-    }
-
     // Wormhole-trace regression #1: DeepSeek v4 Pro emits
     //   <file path="X.py" content="<<<CONTENT\nLINES\n<<<END"/>
     // multi-line. Previously dropped silently (zero tool calls).
@@ -4042,32 +3935,6 @@ mod tests {
             "open-without-close must not yield a call: {:?}",
             calls
         );
-    }
-
-    #[test]
-    fn promotes_cjk_bracket_call_marker_for_bash() {
-        let text = "[\u{8C03}\u{7528} bash] {\"command\":\"Start-Process notepad\"}";
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "bash");
-        assert!(calls[0].args.contains("Start-Process notepad"));
-    }
-
-    #[test]
-    fn promotes_cjk_bare_call_marker() {
-        // Bare form: "\u{8C03}\u{7528} screenshot" with no brackets.
-        let text = "\u{8C03}\u{7528} screenshot";
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "screenshot");
-    }
-
-    #[test]
-    fn ignores_cjk_marker_when_tool_name_unknown() {
-        // Unknown tool name must NOT be promoted to avoid false positives.
-        let text = "[\u{8C03}\u{7528} not_a_real_tool] {\"x\":1}";
-        let calls = extract_tool_calls(text);
-        assert!(calls.is_empty(), "expected no calls, got {:?}", calls);
     }
 
     // Regression: `< /toolcall >\nTOOL ARGS\n< /toolcall >` triplets,

@@ -543,6 +543,11 @@ fn run_tool_loop_core(
     let mut strict_forced_execution_attempts = 0usize;
     let mut bilingual_md_retries = 0usize;
     let mut review_schema_retries = 0usize;
+    // Some gateways occasionally emit an empty `stop` response immediately
+    // after tool results. Treat that as a transient protocol stall and
+    // re-invoke the native continuation a few times before accepting it as a
+    // real final answer.
+    let mut empty_continuation_retries = 0usize;
     let started = Instant::now();
 
     // Auto-compaction threshold for long-running tasks. Default ~120K input
@@ -822,6 +827,23 @@ fn run_tool_loop_core(
                     current = next;
                     break;
                 }
+                if next.native_tool_calls.is_empty()
+                    && next.text.trim().is_empty()
+                    && Runtime::stop_reason_alias(&next.stop_reason) == "completed"
+                    && empty_continuation_retries < 2
+                {
+                    empty_continuation_retries += 1;
+                    loop_info(
+                        mode,
+                        ui,
+                        &format!(
+                            "auto-agent: empty native continuation response; retrying ({}/2)",
+                            empty_continuation_retries
+                        ),
+                    );
+                    continue;
+                }
+                empty_continuation_retries = 0;
                 steps += next.native_tool_calls.len().max(1);
                 if is_tool_failure(&next) {
                     consecutive_failures += 1;
