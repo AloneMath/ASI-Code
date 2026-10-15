@@ -144,8 +144,13 @@ pub struct ProviderClient {
 /// Return a safe max_tokens value for the given provider.
 /// These values are conservative defaults that work for most models.
 /// The API will cap to the model's actual context limit if lower.
-fn max_tokens_for_provider(provider: &str) -> u64 {
+fn max_tokens_for_provider(provider: &str, model: &str) -> u64 {
     match provider {
+        // Thinking tokens count against max_tokens. With reasoning enabled a
+        // 4096 budget is often spent entirely on thinking, leaving an empty
+        // answer with finish_reason=length (verified against deepseek-v4-pro,
+        // which accepts far larger values without a 400).
+        "deepseek" if should_enable_deepseek_reasoning_effort(provider, model) => 32768,
         "deepseek" => 4096, // DeepSeek is stricter on max_tokens; keep conservative to avoid 400 errors
         "claude" => 32768,  // Claude models support large contexts (200k), 32k is reasonable
         _ => 16384,         // OpenAI-compatible defaults (GPT-4, etc.)
@@ -197,13 +202,13 @@ fn ensure_success_response(label: &str, response: Response) -> Result<Response, 
     }
 }
 
-fn configured_max_tokens(provider: &str) -> u64 {
+fn configured_max_tokens(provider: &str, model: &str) -> u64 {
     let key = match provider {
         "deepseek" => "ASI_MAX_TOKENS_DEEPSEEK",
         "claude" => "ASI_MAX_TOKENS_CLAUDE",
         _ => "ASI_MAX_TOKENS_OPENAI",
     };
-    let default_value = max_tokens_for_provider(provider);
+    let default_value = max_tokens_for_provider(provider, model);
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -226,11 +231,11 @@ fn uses_modern_openai_parameters(model: &str) -> bool {
 
 fn apply_openai_model_parameters(payload: &mut Value, model: &str, provider: &str) {
     if provider == "deepseek" || !uses_modern_openai_parameters(model) {
-        payload["max_tokens"] = Value::from(configured_max_tokens(provider));
+        payload["max_tokens"] = Value::from(configured_max_tokens(provider, model));
         return;
     }
 
-    let max_tokens = configured_max_tokens(provider);
+    let max_tokens = configured_max_tokens(provider, model);
     if let Some(object) = payload.as_object_mut() {
         object.remove("max_tokens");
         object.remove("temperature");
@@ -1258,7 +1263,7 @@ impl ProviderClient {
             "model": self.model,
             "messages": api_messages,
             "temperature": 0.2,
-            "max_tokens": configured_max_tokens(&self.provider),
+            "max_tokens": configured_max_tokens(&self.provider, &self.model),
             "stream": true,
             "tools": tool_definitions_openai()
         });
@@ -1624,7 +1629,7 @@ impl ProviderClient {
 
         let payload = json!({
             "model": self.model,
-            "max_tokens": configured_max_tokens(&self.provider),
+            "max_tokens": configured_max_tokens(&self.provider, &self.model),
             "system": system,
             "messages": api_messages,
             "tools": tool_definitions_claude(),
@@ -1787,7 +1792,7 @@ impl ProviderClient {
             "model": self.model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": configured_max_tokens(&self.provider)
+            "max_tokens": configured_max_tokens(&self.provider, &self.model)
         });
         apply_openai_model_parameters(&mut payload, &self.model, &self.provider);
         if should_enable_deepseek_reasoning_effort(&self.provider, &self.model) {
@@ -1862,7 +1867,7 @@ impl ProviderClient {
             "model": self.model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": configured_max_tokens(&self.provider),
+            "max_tokens": configured_max_tokens(&self.provider, &self.model),
             "stream": true
         });
         apply_openai_model_parameters(&mut payload, &self.model, &self.provider);
@@ -1999,7 +2004,7 @@ impl ProviderClient {
 
         let payload = json!({
             "model": self.model,
-            "max_tokens": configured_max_tokens(&self.provider),
+            "max_tokens": configured_max_tokens(&self.provider, &self.model),
             "system": system,
             "messages": filtered,
         });
@@ -2075,7 +2080,7 @@ impl ProviderClient {
 
         let payload = json!({
             "model": self.model,
-            "max_tokens": configured_max_tokens(&self.provider),
+            "max_tokens": configured_max_tokens(&self.provider, &self.model),
             "system": system,
             "messages": filtered,
             "stream": true,

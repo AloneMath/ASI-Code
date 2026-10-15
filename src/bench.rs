@@ -390,6 +390,8 @@ fn suite_cases(suite: crate::BenchSuite) -> &'static [BenchCaseDef] {
     match suite {
         crate::BenchSuite::Core => &CORE_CASES,
         crate::BenchSuite::Gpt53Proxy6d => &GPT53_PROXY_6D_CASES,
+        // Dispatched to bench_tasks before reaching this module.
+        crate::BenchSuite::Tasks => &[],
     }
 }
 
@@ -535,17 +537,29 @@ fn run_case(
     case_result
 }
 
-fn run_case_inner(
+/// Outcome of running one prompt through the same entry path as
+/// `asi prompt --agent`: first turn plus the auto tool loop.
+pub(crate) struct AgentRun {
+    pub result: crate::runtime::TurnResult,
+    pub turn_cost_usd: f64,
+    pub agent_steps: usize,
+    pub agent_loop_stop_reason: Option<String>,
+    pub changed_files: Vec<String>,
+    pub confidence_gate_stats: crate::ConfidenceGateStats,
+}
+
+pub(crate) fn run_agent_prompt(
     cfg: &crate::config::AppConfig,
     rt: &mut crate::runtime::Runtime,
-    case: BenchCaseDef,
-    round: usize,
+    prompt: &str,
+    agent: bool,
+    secure: bool,
+    profile: crate::PromptProfile,
     agent_max_steps: usize,
-) -> Result<BenchCaseResult, String> {
-    let started = Instant::now();
+) -> Result<AgentRun, String> {
     let mut changed_files = Vec::new();
     let (model_input, prompt_agent_enabled, _) =
-        crate::prepare_prompt_agent_input(case.prompt, case.agent, case.secure, case.profile)?;
+        crate::prepare_prompt_agent_input(prompt, agent, secure, profile)?;
 
     let mut result = rt.run_turn(&model_input);
     crate::log_interaction_event(cfg, rt, &model_input, &result);
@@ -559,6 +573,7 @@ fn run_case_inner(
     let mut agent_steps = 0usize;
     let mut agent_loop_stop_reason = None;
     let mut confidence_gate_stats = crate::ConfidenceGateStats::default();
+    let strict = profile == crate::PromptProfile::Strict;
 
     if prompt_agent_enabled && crate::is_auto_loop_continuable_stop_reason(&result.stop_reason)
     {
@@ -583,30 +598,23 @@ fn run_case_inner(
             )
             .clamp(1, 50),
         };
-        let complexity = crate::estimate_task_complexity(
-            case.prompt,
-            case.profile == crate::PromptProfile::Strict,
+        let complexity = crate::estimate_task_complexity(prompt, strict);
+        let limits = crate::apply_adaptive_budgets(
+            base_limits,
+            complexity,
+            strict,
+            crate::ExecutionSpeed::Deep,
         );
-        let limits =
-            crate::apply_adaptive_budgets(
-                base_limits,
-                complexity,
-                case.profile == crate::PromptProfile::Strict,
-                crate::ExecutionSpeed::Deep,
-            );
         let mut file_synopsis_cache = crate::FileSynopsisCache::default();
         let (loop_result, extra_cost, steps, loop_stop_reason) = crate::run_prompt_auto_tool_loop(
             rt,
             cfg,
-            case.prompt,
+            prompt,
             &result,
             &mut changed_files,
-            case.profile == crate::PromptProfile::Strict,
+            strict,
             crate::ExecutionSpeed::Deep,
-            crate::derive_tool_execution_constraints(
-                case.prompt,
-                case.profile == crate::PromptProfile::Strict,
-            ),
+            crate::derive_tool_execution_constraints(prompt, strict),
             limits,
             None,
             &mut file_synopsis_cache,
@@ -617,6 +625,39 @@ fn run_case_inner(
         agent_steps = steps;
         agent_loop_stop_reason = loop_stop_reason;
     }
+
+    Ok(AgentRun {
+        result,
+        turn_cost_usd: turn_cost_sum,
+        agent_steps,
+        agent_loop_stop_reason,
+        changed_files,
+        confidence_gate_stats,
+    })
+}
+
+fn run_case_inner(
+    cfg: &crate::config::AppConfig,
+    rt: &mut crate::runtime::Runtime,
+    case: BenchCaseDef,
+    round: usize,
+    agent_max_steps: usize,
+) -> Result<BenchCaseResult, String> {
+    let started = Instant::now();
+    let run = run_agent_prompt(
+        cfg,
+        rt,
+        case.prompt,
+        case.agent,
+        case.secure,
+        case.profile,
+        agent_max_steps,
+    )?;
+    let mut result = run.result;
+    let mut turn_cost_sum = run.turn_cost_usd;
+    let mut agent_steps = run.agent_steps;
+    let agent_loop_stop_reason = run.agent_loop_stop_reason;
+    let confidence_gate_stats = run.confidence_gate_stats;
 
     let expectation = case.expectation;
     let (mut pass, mut check) = evaluate_case(expectation, &result, agent_steps);

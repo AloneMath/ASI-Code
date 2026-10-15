@@ -45,6 +45,9 @@ impl LocalSandbox {
         }
     }
 
+    /// Best-effort keyword screen. This is advisory only: it is trivially
+    /// bypassed (e.g. `python -c "import urllib..."`). Use ASI_SANDBOX=docker
+    /// for enforced network isolation.
     fn command_looks_networked(command: &str) -> bool {
         let lower = command.to_ascii_lowercase();
         [

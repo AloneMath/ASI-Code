@@ -15,9 +15,6 @@ pub fn parse_toolcall_line(line: &str) -> Option<ToolCallRequest> {
 }
 
 pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
-    let mut normalized_toolcall_lines: Vec<(String, usize)> = Vec::new();
-    let mut previous_tool_end_line: Option<usize> = None;
-
     let single_line_wrapper_normalized = normalize_single_line_toolcall_wrapper(text);
     let pseudo_xml_normalized = normalize_pseudo_xml_toolcall_markers(&single_line_wrapper_normalized);
     let inline_calling_normalized = normalize_inline_angle_calling_blocks(&pseudo_xml_normalized);
@@ -39,11 +36,54 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCallRequest> {
     let normalized = strip_markdown_fences(&file_alias_normalized);
     let with_tool_argument_pairs = normalize_tool_argument_pairs(&normalized);
     let preexpanded = normalize_tag_style_toolcalls(&with_tool_argument_pairs);
+    collect_toolcalls_from_text(&preexpanded, false)
+}
+
+/// Strict fallback parser used when native tool calling is active and
+/// reliable. Only canonical `/toolcall` lines that start a line outside of
+/// markdown fences are accepted; fenced shell blocks, pseudo-XML tags and
+/// inline mentions are treated as plain prose and never executed.
+pub fn extract_tool_calls_strict(text: &str) -> Vec<ToolCallRequest> {
+    let mut outside_fences: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut in_heredoc = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if in_heredoc {
+            // Heredoc bodies may legitimately contain fences.
+            outside_fences.push(line);
+            if trimmed == "<<<END" {
+                in_heredoc = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.starts_with("/toolcall ") && trimmed.contains("<<<") {
+            in_heredoc = true;
+        }
+        outside_fences.push(line);
+    }
+    collect_toolcalls_from_text(&outside_fences.join("\n"), true)
+}
+
+fn collect_toolcalls_from_text(preexpanded: &str, require_line_start: bool) -> Vec<ToolCallRequest> {
+    let mut normalized_toolcall_lines: Vec<(String, usize)> = Vec::new();
+    let mut previous_tool_end_line: Option<usize> = None;
     let lines: Vec<&str> = preexpanded.lines().collect();
     let mut i = 0usize;
 
     while i < lines.len() {
         let line = lines[i].trim();
+        if require_line_start && !line.starts_with("/toolcall ") {
+            i += 1;
+            continue;
+        }
         let Some(idx) = line.find("/toolcall ") else {
             i += 1;
             continue;
@@ -3055,7 +3095,45 @@ fn normalize_arg_token(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_tool_calls, parse_toolcall_line};
+    use super::{extract_tool_calls, extract_tool_calls_strict, parse_toolcall_line};
+
+    #[test]
+    fn strict_ignores_fenced_shell_blocks_in_final_answer() {
+        let text = "Done. To verify locally run:\n```bash\ncargo test\n```\n";
+        assert!(extract_tool_calls_strict(text).is_empty());
+        // The lenient path promotes the same block; strict must not.
+        assert!(!extract_tool_calls(text).is_empty());
+    }
+
+    #[test]
+    fn strict_ignores_toolcall_examples_inside_fences_and_inline_prose() {
+        let text = "Example usage:\n```text\n/toolcall bash rm -rf build\n```\nYou can also type `/toolcall bash ls` yourself.";
+        assert!(extract_tool_calls_strict(text).is_empty());
+    }
+
+    #[test]
+    fn strict_ignores_pseudo_xml_wrappers() {
+        let text = "<toolcall>read_file buggy_calc.py 1 240</toolcall>";
+        assert!(extract_tool_calls_strict(text).is_empty());
+    }
+
+    #[test]
+    fn strict_accepts_canonical_line_leading_toolcalls() {
+        let text = "Reading files now.\n/toolcall read_file src/main.rs\n/toolcall glob_search \"src/**/*.rs\"";
+        let calls = extract_tool_calls_strict(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[1].name, "glob_search");
+    }
+
+    #[test]
+    fn strict_keeps_heredoc_body_containing_fences() {
+        let text = "/toolcall write_file README.md <<<CONTENT\n# Title\n```bash\ncargo run\n```\n<<<END";
+        let calls = extract_tool_calls_strict(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert!(calls[0].args.contains("cargo run"));
+    }
 
     #[test]
     fn parses_function_style_toolcall() {

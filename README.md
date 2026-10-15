@@ -236,6 +236,32 @@ The journal piggybacks on the existing single-file checkpoint, so disk footprint
 - **Tier 6 (next, then):** mobile and cross-device remote — a small relay so the CLI can be triggered from a phone or another machine.
 - **Tier 7 (deliberately not pursued in 2.0):** AGI-level autonomous creative work. The bridge layer is the leverage — when the underlying models get stronger, every existing bridge inherits the new capability automatically.
 
+## Future Direction: Closing the Feedback Loop
+
+Today's large models are not mainly short of parameters, and more raw data alone only teaches them what is already in that data. What they lack most is a **verifiable, interactive, continuously learning feedback loop**.
+
+Claude Code and Codex draw their strength from first-party models co-trained with their own tools. ASI Code puts its strength in the **loop** instead. What model builders need most is real agent trajectories with verified outcome labels, and an agent tool produces exactly that as a natural by-product of doing its job.
+
+### Phase 1 — Verifiable (the foundation everything else depends on)
+
+- **Verifier registry:** build, tests, lint, type checks, plus the 2.0 `probe_diff` and screenshot comparison, unified behind a single interface and enabled by default.
+- **Define "done" before acting:** the agent first writes down its acceptance criteria, e.g. when fixing a bug it first writes a test that fails.
+- **Programs decide the verdict:** every task ends in exactly one of three states: `passed`, `failed`, or `unverified`. The model is never allowed to declare success on its own.
+
+### Phase 2 — Trajectory Recording
+
+- Every run is stored in a structured form: task, context, each action and observation, the verification verdict, and user feedback (accepted, reverted, or modified).
+- User feedback is the most honest signal there is. If the user reverts the agent's change, the run failed, even if the tests passed.
+
+### Phase 3 — Continuous Learning (at the tool layer, without touching model weights)
+
+- **Experience memory:** distill from verified trajectories what works in this project and what has failed before, and apply it automatically next time. Every lesson records its source and is re-verified when the code changes, so memory never goes stale.
+- **Self-improvement:** propose prompt or skill changes from failed trajectories, judge them against the eval baseline (`asi bench --suite tasks --baseline <report.json>`), and keep only changes that do not regress.
+
+### Phase 4 — Data Export
+
+- Export verified trajectories in SFT / RL training formats. This is ASI Code's most distinctive contribution to model training: every sample carries a verifiable outcome label, not just text.
+
 ## Quick Start
 
 ```powershell

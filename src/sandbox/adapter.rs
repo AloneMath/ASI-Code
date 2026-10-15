@@ -18,6 +18,9 @@ pub trait SandboxAdapter {
 pub enum SandboxStrategy {
     Disabled(NoopSandbox),
     Local(LocalSandbox),
+    /// Shell commands run in a network-less container (see `exec.rs`);
+    /// isolation is enforced by the container, so no keyword preflight.
+    Docker(NoopSandbox),
 }
 
 impl SandboxStrategy {
@@ -25,6 +28,7 @@ impl SandboxStrategy {
         let mode = env::var("ASI_SANDBOX").unwrap_or_else(|_| "local".to_string());
         match mode.trim().to_ascii_lowercase().as_str() {
             "local" => Self::Local(LocalSandbox::from_env()),
+            "docker" => Self::Docker(NoopSandbox),
             "disabled" | "off" | "none" => Self::Disabled(NoopSandbox),
             _ => Self::Local(LocalSandbox::from_env()),
         }
@@ -34,6 +38,7 @@ impl SandboxStrategy {
         match self {
             Self::Disabled(adapter) => adapter.name(),
             Self::Local(adapter) => adapter.name(),
+            Self::Docker(_) => "docker",
         }
     }
 
@@ -41,6 +46,7 @@ impl SandboxStrategy {
         match self {
             Self::Disabled(adapter) => adapter.preflight(ctx),
             Self::Local(adapter) => adapter.preflight(ctx),
+            Self::Docker(adapter) => adapter.preflight(ctx),
         }
     }
 }

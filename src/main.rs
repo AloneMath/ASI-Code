@@ -3,6 +3,7 @@ mod agentd;
 mod audit;
 mod autoresearch;
 mod bench;
+mod bench_tasks;
 mod config;
 mod cost;
 mod cron;
@@ -295,6 +296,12 @@ enum Command {
         suite: BenchSuite,
         #[arg(long, default_value = "bench_reports")]
         out_dir: PathBuf,
+        /// tasks suite: comma-separated task ids to run.
+        #[arg(long)]
+        only: Option<String>,
+        /// tasks suite: previous report JSON to diff against.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
     },
     Ue5 {
         #[arg(long)]
@@ -376,6 +383,8 @@ impl Default for ExecutionSpeed {
 enum BenchSuite {
     Core,
     Gpt53Proxy6d,
+    /// SWE-style fixture tasks verified by hidden tests.
+    Tasks,
 }
 
 impl BenchSuite {
@@ -383,6 +392,7 @@ impl BenchSuite {
         match self {
             BenchSuite::Core => "core",
             BenchSuite::Gpt53Proxy6d => "gpt53-proxy-6d",
+            BenchSuite::Tasks => "tasks",
         }
     }
 }
@@ -12337,6 +12347,7 @@ fn build_bilingual_markdown_artifact_prompt(
     )
 }
 
+#[cfg(test)]
 fn planned_toolcall_count(text: &str) -> usize {
     let engine = OrchestratorEngine::new(200, 4);
     engine
@@ -12569,6 +12580,19 @@ fn should_skip_workspace_entry(name: &str) -> bool {
     )
 }
 
+/// ASI Code's own state (config, audit log, session store, bench output).
+/// Listing these in the workspace snapshot invites the agent to read its
+/// own bookkeeping instead of the user's project. A `sessions` directory
+/// is only treated as ASI state when it holds the ASI checkpoint file, so a
+/// user's own `sessions/` code package is still listed.
+fn is_asi_state_entry(path: &Path, name: &str) -> bool {
+    match name {
+        ".asi" | ".asi-rust-temp" | ".asi_audit.jsonl" | "bench_reports" => true,
+        "sessions" => path.join("_checkpoint_latest.json").is_file(),
+        _ => false,
+    }
+}
+
 fn clip_chars(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (i, ch) in text.chars().enumerate() {
@@ -12606,7 +12630,7 @@ fn collect_workspace_entries(
 
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if should_skip_workspace_entry(&name) {
+        if should_skip_workspace_entry(&name) || is_asi_state_entry(&path, &name) {
             continue;
         }
 
@@ -22489,6 +22513,39 @@ mod autoresearch_repl_parse_tests {
         assert_eq!(opts.log_path, Some(PathBuf::from("results/run.log")));
         assert_eq!(opts.description.as_deref(), Some("baseline run"));
         assert_eq!(opts.status.as_deref(), Some("keep"));
+    }
+}
+
+#[cfg(test)]
+mod workspace_snapshot_tests {
+    use super::build_workspace_snapshot;
+    use std::fs;
+
+    #[test]
+    fn snapshot_hides_asi_state_but_keeps_user_sessions_package() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("asi_snapshot_{}", nonce));
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".asi")).unwrap();
+        fs::create_dir_all(project.join("sessions")).unwrap();
+        fs::write(project.join("sessions").join("_checkpoint_latest.json"), "{}").unwrap();
+        fs::write(project.join(".asi_audit.jsonl"), "").unwrap();
+        fs::write(project.join("main.py"), "print(1)\n").unwrap();
+        let snapshot = build_workspace_snapshot(&project);
+        assert!(snapshot.contains("main.py"), "{}", snapshot);
+        assert!(!snapshot.contains(".asi"), "{}", snapshot);
+        assert!(!snapshot.contains("sessions"), "{}", snapshot);
+
+        // A user's own `sessions/` package (no ASI checkpoint) stays visible.
+        let other = root.join("other");
+        fs::create_dir_all(other.join("sessions")).unwrap();
+        fs::write(other.join("sessions").join("store.py"), "x = 1\n").unwrap();
+        let snapshot = build_workspace_snapshot(&other);
+        assert!(snapshot.contains("sessions/"), "{}", snapshot);
+        let _ = fs::remove_dir_all(root);
     }
 }
 

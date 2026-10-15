@@ -8,9 +8,10 @@ use crate::provider::{
     tool_call_to_legacy_args, ChatMessage, ChatProvider, CompletionResult, ProviderClient,
     StreamingResult, ToolCallSpec,
 };
+use crate::orchestrator::types::{classify_tool_call, ToolCallKind};
 use crate::sandbox::{SandboxPreflightContext, SandboxStrategy};
 use crate::security;
-use crate::tools::{DefaultToolRunner, ToolRunner};
+use crate::tools::{DefaultToolRunner, ToolResult, ToolRunner};
 use serde_json::json;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ use std::time::Duration;
 
 const LENGTH_CONTINUATION_PROMPT: &str =
     "Continue from exactly where you stopped due to length. Do not repeat prior text. Finish the remaining response.";
+
+const EMPTY_LENGTH_HINT: &str = "[no answer] The model spent its entire output budget on hidden reasoning before writing a reply (stop_reason=length). Retry with a narrower question, raise the limit (e.g. ASI_MAX_TOKENS_DEEPSEEK=65536), or lower thinking effort (ASI_DEEPSEEK_REASONING_EFFORT=high).";
 
 #[derive(Debug, Clone)]
 pub struct TurnResult {
@@ -159,6 +162,12 @@ pub struct ModelCapabilities {
     pub native_tool_calling_default: bool,
     pub native_tool_calling_supported: bool,
     pub recommended_max_output_tokens: u64,
+    /// When native tool calling is active, only accept canonical
+    /// line-leading `/toolcall` text as a fallback (no fenced-block
+    /// promotion or pseudo-XML heuristics). Enabled for providers whose
+    /// native tool_use is reliable, so prose or code samples in a final
+    /// answer are never mistaken for actions.
+    pub strict_text_toolcall_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,7 +502,9 @@ impl Runtime {
             return ModelCapabilities {
                 native_tool_calling_default: false,
                 native_tool_calling_supported: false,
-                recommended_max_output_tokens: 4096,
+                // Thinking model: matches provider::max_tokens_for_provider.
+                recommended_max_output_tokens: 32_768,
+                strict_text_toolcall_fallback: false,
             };
         }
 
@@ -502,7 +513,10 @@ impl Runtime {
             return ModelCapabilities {
                 native_tool_calling_default: native,
                 native_tool_calling_supported: native,
-                recommended_max_output_tokens: 4096,
+                // v4-pro runs with reasoning enabled; thinking needs headroom.
+                recommended_max_output_tokens: if model.contains("v4-pro") { 32_768 } else { 4096 },
+                // DeepSeek often emits text-form calls even in native mode.
+                strict_text_toolcall_fallback: false,
             };
         }
 
@@ -511,6 +525,7 @@ impl Runtime {
                 native_tool_calling_default: true,
                 native_tool_calling_supported: true,
                 recommended_max_output_tokens: 32_768,
+                strict_text_toolcall_fallback: true,
             };
         }
 
@@ -519,6 +534,7 @@ impl Runtime {
                 native_tool_calling_default: true,
                 native_tool_calling_supported: true,
                 recommended_max_output_tokens: 16_384,
+                strict_text_toolcall_fallback: true,
             };
         }
 
@@ -526,7 +542,15 @@ impl Runtime {
             native_tool_calling_default: false,
             native_tool_calling_supported: false,
             recommended_max_output_tokens: 8192,
+            strict_text_toolcall_fallback: false,
         }
+    }
+
+    /// True when text-form toolcalls should be parsed strictly: native tool
+    /// calling is active and the provider's native protocol is reliable.
+    pub fn strict_text_toolcall_parsing(&self) -> bool {
+        self.native_tool_calling
+            && Self::capabilities_for(&self.provider, &self.model).strict_text_toolcall_fallback
     }
 
     pub fn run_turn(&mut self, user_text: &str) -> TurnResult {
@@ -1087,6 +1111,51 @@ impl Runtime {
             .clamp(0, 12)
     }
 
+    /// Native-path counterpart of `complete_streaming_with_length_continuation`:
+    /// when a text-only answer was cut off by the output limit, ask the model
+    /// to continue and stitch the parts together. The scaffolding messages
+    /// used to request continuation are removed afterwards so history keeps
+    /// a single assistant turn with the full text.
+    fn continue_native_after_length<F>(
+        &mut self,
+        first: CompletionResult,
+        on_delta: &mut F,
+    ) -> CompletionResult
+    where
+        F: FnMut(&str),
+    {
+        let needs_continuation = |c: &CompletionResult| {
+            c.tool_calls.is_empty()
+                && !c.text.trim().is_empty()
+                && Self::stop_reason_alias(&c.stop_reason) == "length"
+        };
+        if !needs_continuation(&first) {
+            return first;
+        }
+        let history_len = self.messages.len();
+        let max_rounds = Self::length_continuation_max_rounds();
+        let mut combined = first;
+        let mut rounds = 0usize;
+        while needs_continuation(&combined) && rounds < max_rounds {
+            self.messages
+                .push(ChatMessage::text("assistant", combined.text.clone()));
+            self.messages.push(ChatMessage::text(
+                "user".to_string(),
+                LENGTH_CONTINUATION_PROMPT.to_string(),
+            ));
+            let next = match self.complete_with_tools_with_resilience(on_delta) {
+                Ok((next, _)) => next,
+                Err(_) => break,
+            };
+            combined.text.push_str(&next.text);
+            combined.stop_reason = next.stop_reason;
+            combined.tool_calls = next.tool_calls;
+            rounds += 1;
+        }
+        self.messages.truncate(history_len);
+        combined
+    }
+
     fn complete_streaming_with_length_continuation<F>(
         &mut self,
         on_delta: &mut F,
@@ -1140,6 +1209,10 @@ impl Runtime {
         F: FnMut(&str),
     {
         let result = self.complete_with_tools_with_resilience(on_delta);
+        let result = match result {
+            Ok((completion, note)) => Ok((self.continue_native_after_length(completion, on_delta), note)),
+            Err(e) => Err(e),
+        };
 
         match result {
             Ok((completion, fallback_note)) => {
@@ -1149,6 +1222,32 @@ impl Runtime {
                 self.cumulative_output_tokens += output_tokens;
                 let turn_cost = cost::estimate_cost_usd(&self.model, input_tokens, output_tokens);
                 self.cumulative_cost_usd += turn_cost;
+
+                if completion_text.trim().is_empty()
+                    && completion.tool_calls.is_empty()
+                    && Self::stop_reason_alias(&completion.stop_reason) == "length"
+                {
+                    // The whole output budget went to hidden reasoning. Say so
+                    // instead of printing nothing, and record an assistant turn
+                    // so history never holds back-to-back user messages (which
+                    // makes the next prompt fail the same way).
+                    let text = EMPTY_LENGTH_HINT.to_string();
+                    self.messages.push(ChatMessage::text("assistant", text.clone()));
+                    self.record_stop_reason(&completion.stop_reason);
+                    return TurnResult {
+                        text,
+                        stop_reason: completion.stop_reason,
+                        input_tokens,
+                        output_tokens,
+                        total_input_tokens: self.cumulative_input_tokens,
+                        total_output_tokens: self.cumulative_output_tokens,
+                        is_tool_result: false,
+                        turn_cost_usd: turn_cost,
+                        total_cost_usd: self.cumulative_cost_usd,
+                        thinking,
+                        native_tool_calls: Vec::new(),
+                    };
+                }
 
                 if !completion_text.is_empty() && completion.tool_calls.is_empty() {
                     self.messages
@@ -1180,6 +1279,7 @@ impl Runtime {
                 }
 
                 let mut native_results = Vec::new();
+                let mut pending_exec: Vec<(usize, String, String)> = Vec::new();
                 for tc in &completion.tool_calls {
                     let legacy_args = tool_call_to_legacy_args(&tc.name, &tc.arguments);
                     let normalized_args = normalize_tool_args(&tc.name, &legacy_args);
@@ -1387,21 +1487,25 @@ impl Runtime {
                         "allowed",
                     );
 
-                    let tool_result = self.tool_runner.run(&tc.name, &normalized_args);
-                    let _ = run_event_hooks(
-                        &hooks,
-                        "PostToolUse",
-                        &tc.name,
-                        &normalized_args,
-                        &self.permission_mode,
-                    );
+                    // Defer execution: all permission checks run first (in
+                    // order, since approval can be interactive), then the
+                    // approved calls execute together below.
+                    pending_exec.push((native_results.len(), tc.name.clone(), normalized_args));
                     native_results.push(NativeToolResult {
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
                         tool_args_display: args_display,
-                        result_text: tool_result.output.clone(),
-                        ok: tool_result.ok,
+                        result_text: String::new(),
+                        ok: false,
                     });
+                }
+
+                let tool_outputs = run_native_tools_maybe_parallel(&self.tool_runner, &pending_exec);
+                let post_hooks = Self::load_hook_config();
+                for ((slot, name, args), tool_result) in pending_exec.iter().zip(tool_outputs) {
+                    let _ = run_event_hooks(&post_hooks, "PostToolUse", name, args, &self.permission_mode);
+                    native_results[*slot].result_text = tool_result.output;
+                    native_results[*slot].ok = tool_result.ok;
                 }
 
                 self.consume_next_permissions();
@@ -2018,6 +2122,67 @@ impl Runtime {
     /// back to lossy `compact` so the operation never leaves the runtime
     /// in a half-state.
     pub fn compact_with_summary(&mut self, keep_last: usize) -> String {
+        self.compact_with_summary_for_task(keep_last, None)
+    }
+
+    /// Produce a final answer after the agent loop stopped on a budget
+    /// (steps, time, no progress) while the last turn was still a tool
+    /// result. Uses the text-only completion path, which sends no tool
+    /// definitions, so the model cannot start another round of tool calls.
+    /// Returns None if the provider fails or returns nothing.
+    pub fn wrap_up_without_tools(&mut self, task: &str, stop_reason: &str) -> Option<TurnResult> {
+        let body: Vec<ChatMessage> = self.messages.iter().skip(1).cloned().collect();
+        let evidence = build_wrap_up_evidence(&body, 60_000);
+        let request = vec![
+            ChatMessage::text("system".to_string(), WRAP_UP_SYSTEM_PROMPT.to_string()),
+            ChatMessage::text(
+                "user".to_string(),
+                format!(
+                    "TASK:\n{}\n\nThe agent stopped before answering ({}). Evidence gathered so far:\n\n{}\n\nWrite the final answer to the TASK now.",
+                    clip_with_marker(task, 4000),
+                    stop_reason,
+                    evidence
+                ),
+            ),
+        ];
+        let mut streamed = String::new();
+        let result = self
+            .client
+            .complete_streaming_dyn(&request, &mut |delta| streamed.push_str(delta));
+        let text = match result {
+            Ok(r) if !streamed.trim().is_empty() => streamed,
+            Ok(r) if !r.text.trim().is_empty() => r.text,
+            _ => return None,
+        };
+        let input_tokens = request.iter().map(|m| estimate_tokens(&m.content)).sum::<usize>();
+        let output_tokens = estimate_tokens(&text);
+        self.cumulative_input_tokens += input_tokens;
+        self.cumulative_output_tokens += output_tokens;
+        let turn_cost = cost::estimate_cost_usd(&self.model, input_tokens, output_tokens);
+        self.cumulative_cost_usd += turn_cost;
+        // An assistant text turn after tool results is a valid continuation
+        // of the native protocol, so the history stays replayable.
+        self.messages.push(ChatMessage::text("assistant", text.clone()));
+        self.record_stop_reason("completed");
+        Some(TurnResult {
+            text,
+            stop_reason: "completed".to_string(),
+            input_tokens,
+            output_tokens,
+            total_input_tokens: self.cumulative_input_tokens,
+            total_output_tokens: self.cumulative_output_tokens,
+            is_tool_result: false,
+            turn_cost_usd: turn_cost,
+            total_cost_usd: self.cumulative_cost_usd,
+            thinking: None,
+            native_tool_calls: Vec::new(),
+        })
+    }
+
+    /// Structured compaction: summarize older turns (decisions, work done,
+    /// failed approaches) while pinning the task text verbatim and keeping
+    /// the recent tail intact.
+    pub fn compact_with_summary_for_task(&mut self, keep_last: usize, task: Option<&str>) -> String {
         let hooks = Self::load_hook_config();
         for outcome in run_event_hooks(
             &hooks,
@@ -2031,41 +2196,37 @@ impl Runtime {
             }
         }
 
-        // Separate history into [system, ...drop_region, ...keep_tail].
+        // Separate history into [system, ...drop_region, ...keep_tail]. The
+        // tail is counted in user/assistant messages, then widened so it never
+        // starts with role="tool" results whose assistant tool_calls message
+        // would otherwise be dropped (an invalid native-protocol history).
         let system_msg = self.messages.first().cloned();
-        let mut tail: Vec<ChatMessage> = self
-            .messages
-            .iter()
-            .skip(1)
-            .filter(|m| m.role == "user" || m.role == "assistant")
-            .cloned()
-            .collect();
-        let kept_count = keep_last.min(tail.len());
-        let keep_tail = tail.split_off(tail.len() - kept_count);
-        let drop_region = tail;
+        let body: Vec<ChatMessage> = self.messages.iter().skip(1).cloned().collect();
+        let split = compaction_split_index(&body, keep_last);
+        let keep_tail: Vec<ChatMessage> = body[split..].to_vec();
+        let drop_region: Vec<ChatMessage> = body[..split].to_vec();
+        let kept_count = keep_tail.len();
 
-        // Nothing to compact.
-        if drop_region.is_empty() {
+        // Nothing to compact (an earlier summary alone does not count).
+        if drop_region.iter().all(is_compacted_summary_message) {
             return "Compact skipped: nothing to summarize.".to_string();
         }
 
-        // Build a compact transcript of the drop region. Truncate each
-        // message to ~600 chars so the summarization prompt stays under
-        // a reasonable token cost even for very long sessions.
-        let mut transcript = String::new();
-        for (i, m) in drop_region.iter().enumerate() {
-            let snippet = if m.content.chars().count() > 600 {
-                let head: String = m.content.chars().take(600).collect();
-                format!(
-                    "{}…[truncated {} chars]",
-                    head,
-                    m.content.chars().count() - 600
-                )
-            } else {
-                m.content.clone()
-            };
-            transcript.push_str(&format!("---\n#{} [{}]:\n{}\n", i + 1, m.role, snippet));
-        }
+        // The task is pinned verbatim so repeated compactions never
+        // paraphrase it away: explicit task > task pinned by an earlier
+        // compaction > first user message.
+        let pinned_task = task
+            .map(|t| t.to_string())
+            .or_else(|| drop_region.iter().find_map(pinned_task_from_summary))
+            .or_else(|| {
+                drop_region
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+            })
+            .map(|t| clip_with_marker(&t, 4000));
+
+        let transcript = build_compaction_transcript(&drop_region);
 
         let summary_instructions = "You are summarizing an in-progress long-running coding session so it can be \
 continued without losing critical state. Output ONLY the summary, no preamble. Use these sections, in this order, each at most a few sentences:\n\
@@ -2095,6 +2256,16 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
             });
 
         let removed = drop_region.len();
+        let task_block = pinned_task
+            .as_deref()
+            .map(|t| format!("{}\n{}\n{}\n", PINNED_TASK_OPEN, t, PINNED_TASK_CLOSE))
+            .unwrap_or_default();
+        // Some gateways ignore streaming and only return the final text.
+        if let Ok(res) = &summary_call {
+            if summary_text.trim().is_empty() {
+                summary_text = res.text.clone();
+            }
+        }
         let result_msg = match summary_call {
             Ok(_) if !summary_text.trim().is_empty() => {
                 // Inject the summary as a synthetic assistant message so the
@@ -2102,7 +2273,9 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
                 // boundary header so downstream prompts and reviewers can see
                 // exactly where the compaction kicked in.
                 let synthesized = ChatMessage::text("assistant".to_string(), format!(
-                        "[COMPACTED CONTEXT — summary of earlier turns]\n{}\n[END OF COMPACTED SUMMARY]",
+                        "{}\n{}{}\n[END OF COMPACTED SUMMARY]",
+                        COMPACTED_SUMMARY_HEADER,
+                        task_block,
                         summary_text.trim()
                     ));
                 let mut new_msgs: Vec<ChatMessage> = Vec::with_capacity(2 + keep_tail.len());
@@ -2120,9 +2293,20 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
             _ => {
                 // Provider error or empty summary: don't leave a half-broken
                 // state. Fall back to plain lossy compact so the user at
-                // least gets the context cap they asked for.
-                let head: Vec<ChatMessage> = system_msg.into_iter().collect();
-                self.messages = [head, keep_tail].concat();
+                // least gets the context cap they asked for, but keep the
+                // pinned task so the agent does not lose its goal.
+                let mut new_msgs: Vec<ChatMessage> = system_msg.into_iter().collect();
+                if !task_block.is_empty() {
+                    new_msgs.push(ChatMessage::text(
+                        "assistant".to_string(),
+                        format!(
+                            "{}\n{}(summary unavailable; older turns were dropped)\n[END OF COMPACTED SUMMARY]",
+                            COMPACTED_SUMMARY_HEADER, task_block
+                        ),
+                    ));
+                }
+                new_msgs.extend(keep_tail);
+                self.messages = new_msgs;
                 format!(
                     "Smart compact failed (provider returned empty); fell back to lossy compact. Removed {} messages.",
                     removed
@@ -2148,14 +2332,33 @@ Keep the whole summary under 800 tokens. Be specific, not generic.";
         if threshold_input_tokens == 0 {
             return None;
         }
-        if self.cumulative_input_tokens >= threshold_input_tokens {
+        // Measure the live context that will be sent next turn. The
+        // cumulative counter never shrinks after compaction, so using it
+        // would re-trigger a compaction on every later iteration.
+        let context_tokens = self.context_tokens_estimate();
+        if context_tokens >= threshold_input_tokens {
             Some(format!(
-                "input tokens {} >= threshold {}",
-                self.cumulative_input_tokens, threshold_input_tokens
+                "context tokens {} >= threshold {}",
+                context_tokens, threshold_input_tokens
             ))
         } else {
             None
         }
+    }
+
+    /// Estimated token size of the current message history, including
+    /// native tool-call arguments.
+    pub fn context_tokens_estimate(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|m| {
+                estimate_tokens(&m.content)
+                    + m.tool_calls
+                        .iter()
+                        .map(|tc| estimate_tokens(&tc.function.arguments))
+                        .sum::<usize>()
+            })
+            .sum()
     }
 
     /// Turn-count threshold check: returns Some(reason) when the live
@@ -2748,6 +2951,165 @@ impl TurnResult {
         }
         self
     }
+}
+
+const COMPACTED_SUMMARY_HEADER: &str = "[COMPACTED CONTEXT — summary of earlier turns]";
+const PINNED_TASK_OPEN: &str = "[ORIGINAL TASK — verbatim]";
+const PINNED_TASK_CLOSE: &str = "[END ORIGINAL TASK]";
+
+fn is_compacted_summary_message(m: &ChatMessage) -> bool {
+    m.role == "assistant" && m.content.starts_with(COMPACTED_SUMMARY_HEADER)
+}
+
+fn pinned_task_from_summary(m: &ChatMessage) -> Option<String> {
+    if !is_compacted_summary_message(m) {
+        return None;
+    }
+    let start = m.content.find(PINNED_TASK_OPEN)? + PINNED_TASK_OPEN.len();
+    let end = m.content[start..].find(PINNED_TASK_CLOSE)? + start;
+    Some(m.content[start..end].trim().to_string())
+}
+
+/// Index in `body` (history without the system message) where the kept tail
+/// starts: the `keep_last`-th user/assistant message from the end, moved
+/// back so the tail never begins with orphaned role="tool" results.
+fn compaction_split_index(body: &[ChatMessage], keep_last: usize) -> usize {
+    let mut split = body.len();
+    let mut counted = 0usize;
+    while split > 0 && counted < keep_last {
+        split -= 1;
+        if body[split].role == "user" || body[split].role == "assistant" {
+            counted += 1;
+        }
+    }
+    while split > 0 && split < body.len() && body[split].role == "tool" {
+        split -= 1;
+    }
+    split
+}
+
+fn clip_with_marker(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{}…[truncated {} chars]", head, total - max_chars)
+}
+
+fn tool_result_looks_failed(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    ["error", "failed", "denied", "not found", "panicked", "exit code", "traceback"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Render the region being summarized so the summarizer sees intent,
+/// decisions and failures, not bulk file contents: earlier summaries are
+/// kept whole, tool calls keep their arguments, successful tool results
+/// shrink to their first line, and failures keep enough text to explain why.
+fn build_compaction_transcript(drop_region: &[ChatMessage]) -> String {
+    let mut transcript = String::new();
+    for (i, m) in drop_region.iter().enumerate() {
+        let body = if is_compacted_summary_message(m) {
+            m.content.clone()
+        } else if m.role == "tool" {
+            if tool_result_looks_failed(&m.content) {
+                format!("FAILED RESULT: {}", clip_with_marker(&m.content, 800))
+            } else {
+                let first = m.content.lines().next().unwrap_or("");
+                format!("ok: {} [body omitted]", clip_with_marker(first, 160))
+            }
+        } else {
+            let mut text = clip_with_marker(&m.content, 600);
+            for tc in &m.tool_calls {
+                text.push_str(&format!(
+                    "\n-> call {}({})",
+                    tc.function.name,
+                    clip_with_marker(&tc.function.arguments, 200)
+                ));
+            }
+            text
+        };
+        transcript.push_str(&format!("---\n#{} [{}]:\n{}\n", i + 1, m.role, body));
+    }
+    transcript
+}
+
+/// Evidence gathered during an agent run, rendered for a tools-disabled
+/// wrap-up call. Unlike the compaction transcript, tool result bodies are
+/// kept (clipped), because the answer usually depends on what was read.
+/// Walks newest-first so the most recent evidence survives the budget.
+fn build_wrap_up_evidence(body: &[ChatMessage], max_total_chars: usize) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for m in body.iter().rev() {
+        let block = if m.role == "tool" {
+            format!("[tool result]\n{}", clip_with_marker(&m.content, 6000))
+        } else if m.role == "assistant" {
+            let mut text = clip_with_marker(&m.content, 1500);
+            for tc in &m.tool_calls {
+                text.push_str(&format!(
+                    "\n-> call {}({})",
+                    tc.function.name,
+                    clip_with_marker(&tc.function.arguments, 200)
+                ));
+            }
+            if text.trim().is_empty() {
+                continue;
+            }
+            format!("[assistant]\n{}", text)
+        } else {
+            continue;
+        };
+        if used + block.len() > max_total_chars {
+            blocks.push("[older evidence omitted]".to_string());
+            break;
+        }
+        used += block.len();
+        blocks.push(block);
+    }
+    blocks.reverse();
+    blocks.join("\n---\n")
+}
+
+const WRAP_UP_SYSTEM_PROMPT: &str = "You are finishing an agent run whose tool budget is exhausted. Tools are disabled: do not request or describe tool calls. Answer the user's task directly from the evidence provided. Be specific and cite file paths. If something could not be checked, say so briefly instead of guessing.";
+
+/// Execute already-approved native tool calls. When every call is a
+/// read/search/web tool they run on scoped threads (results keep call
+/// order); otherwise they run sequentially so writes and shell commands
+/// observe each other's effects.
+fn run_native_tools_maybe_parallel(
+    runner: &Arc<dyn ToolRunner>,
+    pending: &[(usize, String, String)],
+) -> Vec<ToolResult> {
+    let all_concurrency_safe = pending.iter().all(|(_, name, _)| {
+        matches!(
+            classify_tool_call(name),
+            ToolCallKind::Read | ToolCallKind::Search | ToolCallKind::Web
+        )
+    });
+    if pending.len() < 2 || !all_concurrency_safe {
+        return pending
+            .iter()
+            .map(|(_, name, args)| runner.run(name, args))
+            .collect();
+    }
+    thread::scope(|scope| {
+        let handles: Vec<_> = pending
+            .iter()
+            .map(|(_, name, args)| scope.spawn(move || runner.run(name, args)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| ToolResult {
+                    ok: false,
+                    output: "Tool worker panicked".to_string(),
+                })
+            })
+            .collect()
+    })
 }
 
 fn execute_toolcall_command_concurrently(
@@ -3966,6 +4328,56 @@ fn generate_thinking(user_text: &str) -> String {
 }
 
 #[cfg(test)]
+mod native_parallel_tests {
+    use super::run_native_tools_maybe_parallel;
+    use crate::tools::{ToolResult, ToolRunner};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    struct SleepyRunner;
+
+    impl ToolRunner for SleepyRunner {
+        fn run(&self, name: &str, args: &str) -> ToolResult {
+            std::thread::sleep(Duration::from_millis(200));
+            ToolResult {
+                ok: true,
+                output: format!("{}:{}", name, args),
+            }
+        }
+    }
+
+    fn pending(calls: &[(&str, &str)]) -> Vec<(usize, String, String)> {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, (n, a))| (i, n.to_string(), a.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn native_read_only_calls_run_in_parallel_and_keep_order() {
+        let runner: Arc<dyn ToolRunner> = Arc::new(SleepyRunner);
+        let calls = pending(&[("read_file", "a.rs"), ("grep_search", "foo"), ("glob_search", "*.rs")]);
+        let started = Instant::now();
+        let out = run_native_tools_maybe_parallel(&runner, &calls);
+        assert!(started.elapsed() < Duration::from_millis(500), "expected parallel execution");
+        let texts: Vec<_> = out.iter().map(|r| r.output.as_str()).collect();
+        assert_eq!(texts, vec!["read_file:a.rs", "grep_search:foo", "glob_search:*.rs"]);
+    }
+
+    #[test]
+    fn native_calls_with_a_write_run_sequentially() {
+        let runner: Arc<dyn ToolRunner> = Arc::new(SleepyRunner);
+        let calls = pending(&[("read_file", "a.rs"), ("write_file", "b.rs"), ("read_file", "b.rs")]);
+        let started = Instant::now();
+        let out = run_native_tools_maybe_parallel(&runner, &calls);
+        assert!(started.elapsed() >= Duration::from_millis(600), "writes must not run concurrently");
+        assert_eq!(out[1].output, "write_file:b.rs");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         apply_hook_failure_policy, auto_review_decision, build_hook_args_details,
@@ -4015,6 +4427,13 @@ mod tests {
     }
 
     impl MockProvider {
+        fn with_tools_responses(responses: Vec<Result<CompletionResult, String>>) -> Self {
+            Self {
+                streaming: Arc::new(Mutex::new(VecDeque::new())),
+                with_tools: Arc::new(Mutex::new(responses.into())),
+            }
+        }
+
         fn with_streaming(responses: Vec<Result<StreamingResult, String>>) -> Self {
             Self {
                 streaming: Arc::new(Mutex::new(responses.into())),
@@ -4432,6 +4851,175 @@ mod tests {
         assert_eq!(rt.provider_decode_final_fail_count(), 0);
     }
 
+    fn tool_call_spec(id: &str, name: &str, args: &str) -> crate::provider::ToolCallSpec {
+        crate::provider::ToolCallSpec {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: crate::provider::ToolCallFunction {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    fn mock_summary(text: &str) -> Result<StreamingResult, String> {
+        Ok(StreamingResult {
+            text: text.to_string(),
+            stop_reason: "completed".to_string(),
+        })
+    }
+
+    /// History: task, then `rounds` native tool rounds (assistant tool_calls
+    /// followed by a tool result) each with a large file body.
+    fn runtime_with_tool_history(rounds: usize) -> Runtime {
+        let mut rt = Runtime::new(
+            "openai".to_string(),
+            "gpt-test".to_string(),
+            "workspace-write".to_string(),
+            200,
+        );
+        rt.messages.push(ChatMessage::text("user", "Fix the parser bug in src/lib.rs".to_string()));
+        for i in 0..rounds {
+            let id = format!("call_{}", i);
+            rt.messages.push(ChatMessage::assistant_with_tool_calls_and_reasoning(
+                String::new(),
+                vec![tool_call_spec(&id, "read_file", "{\"path\":\"src/lib.rs\"}")],
+                String::new(),
+            ));
+            rt.messages.push(ChatMessage::tool_result(id, format!("src/lib.rs lines 1-400\n{}", "x".repeat(4000))));
+        }
+        rt
+    }
+
+    fn assert_tool_protocol_is_paired(messages: &[ChatMessage]) {
+        for (i, m) in messages.iter().enumerate() {
+            if m.role == "tool" {
+                let id = m.tool_call_id.clone().unwrap_or_default();
+                let has_owner = messages[..i]
+                    .iter()
+                    .any(|p| p.tool_calls.iter().any(|tc| tc.id == id));
+                assert!(has_owner, "orphaned tool result {} at index {}", id, i);
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_native_tool_protocol_paired() {
+        let mut rt = runtime_with_tool_history(10);
+        rt.client = Box::new(MockProvider::with_streaming(vec![mock_summary("WORK DONE: read lib.rs")]));
+        let msg = rt.compact_with_summary(3);
+        assert!(msg.contains("structured summary"), "{}", msg);
+        assert!(rt.messages.iter().any(|m| m.role == "tool"), "recent tool results must be kept");
+        assert_tool_protocol_is_paired(&rt.messages);
+    }
+
+    #[test]
+    fn compaction_pins_task_verbatim_across_repeated_rounds() {
+        let mut rt = runtime_with_tool_history(6);
+        rt.client = Box::new(MockProvider::with_streaming(vec![
+            mock_summary("first summary"),
+            mock_summary("second summary"),
+        ]));
+        rt.compact_with_summary(2);
+        for i in 0..6 {
+            let id = format!("later_{}", i);
+            rt.messages.push(ChatMessage::assistant_with_tool_calls_and_reasoning(
+                String::new(),
+                vec![tool_call_spec(&id, "grep_search", "{\"pattern\":\"fn\"}")],
+                String::new(),
+            ));
+            rt.messages.push(ChatMessage::tool_result(id, "ok".to_string()));
+        }
+        rt.compact_with_summary(2);
+        let summary = rt.messages[1].content.clone();
+        assert!(summary.contains("[ORIGINAL TASK — verbatim]\nFix the parser bug in src/lib.rs\n"), "{}", summary);
+        assert!(summary.contains("second summary"));
+        assert_tool_protocol_is_paired(&rt.messages);
+    }
+
+    #[test]
+    fn compaction_lossy_fallback_still_pins_task() {
+        let mut rt = runtime_with_tool_history(6);
+        rt.client = Box::new(MockProvider::with_streaming(vec![Err("boom".to_string())]));
+        let msg = rt.compact_with_summary_for_task(2, Some("Ship feature X"));
+        assert!(msg.contains("lossy"), "{}", msg);
+        assert!(rt.messages[1].content.contains("Ship feature X"));
+        assert_tool_protocol_is_paired(&rt.messages);
+    }
+
+    #[test]
+    fn auto_compact_trigger_tracks_live_context_not_cumulative_tokens() {
+        let mut rt = runtime_with_tool_history(10);
+        rt.cumulative_input_tokens = 1_000_000;
+        let threshold = 5_000;
+        assert!(rt.auto_compact_recommendation(threshold).is_some());
+        rt.client = Box::new(MockProvider::with_streaming(vec![mock_summary("short summary")]));
+        rt.compact_with_summary(1);
+        assert!(
+            rt.auto_compact_recommendation(threshold).is_none(),
+            "after compaction the live context is small; must not re-trigger (context={})",
+            rt.context_tokens_estimate()
+        );
+    }
+
+    #[test]
+    fn wrap_up_turns_tool_evidence_into_final_answer() {
+        let mut rt = runtime_with_tool_history(3);
+        rt.client = Box::new(MockProvider::with_streaming(vec![mock_summary(
+            "Bug: median() ignores even-length lists (src/lib.rs).",
+        )]));
+        let answer = rt
+            .wrap_up_without_tools("Find the bugs", "reached max tool steps")
+            .expect("wrap-up answer");
+        assert!(answer.text.contains("median()"));
+        assert!(!answer.is_tool_result);
+        assert_eq!(rt.messages.last().unwrap().role, "assistant");
+        assert!(!rt.last_message_is_tool_result());
+        assert_tool_protocol_is_paired(&rt.messages);
+    }
+
+    #[test]
+    fn wrap_up_failure_leaves_history_untouched() {
+        let mut rt = runtime_with_tool_history(2);
+        let before = rt.messages.len();
+        rt.client = Box::new(MockProvider::with_streaming(vec![Err("boom".to_string())]));
+        assert!(rt.wrap_up_without_tools("Find the bugs", "reached max tool steps").is_none());
+        assert_eq!(rt.messages.len(), before);
+    }
+
+    #[test]
+    fn wrap_up_evidence_keeps_file_bodies_and_prefers_newest() {
+        let mut body = Vec::new();
+        for i in 0..30 {
+            body.push(ChatMessage::tool_result(
+                format!("c{}", i),
+                format!("FILE_{} {}", i, "y".repeat(5000)),
+            ));
+        }
+        let evidence = super::build_wrap_up_evidence(&body, 20_000);
+        assert!(evidence.contains("FILE_29"), "newest evidence must be kept");
+        assert!(!evidence.contains("FILE_0 "), "oldest evidence should be dropped under budget");
+        assert!(evidence.starts_with("[older evidence omitted]"));
+    }
+
+    #[test]
+    fn compaction_transcript_drops_file_bodies_but_keeps_failures() {
+        let region = vec![
+            ChatMessage::assistant_with_tool_calls_and_reasoning(
+                "Reading".to_string(),
+                vec![tool_call_spec("a", "read_file", "{\"path\":\"big.rs\"}")],
+                String::new(),
+            ),
+            ChatMessage::tool_result("a".to_string(), format!("big.rs lines 1-900\n{}", "BODYTEXT ".repeat(500))),
+            ChatMessage::tool_result("b".to_string(), "error[E0308]: mismatched types in src/lib.rs:42".to_string()),
+        ];
+        let transcript = super::build_compaction_transcript(&region);
+        assert!(transcript.contains("-> call read_file"));
+        assert!(transcript.contains("ok: big.rs lines 1-900 [body omitted]"));
+        assert!(!transcript.contains("BODYTEXT"));
+        assert!(transcript.contains("FAILED RESULT: error[E0308]"));
+    }
+
     #[test]
     fn decode_error_final_fail_counter_increments_when_retry_exhausted() {
         let mut rt = Runtime::new(
@@ -4508,12 +5096,76 @@ mod tests {
         ));
     }
 
+    fn completion(text: &str, stop: &str) -> Result<CompletionResult, String> {
+        Ok(CompletionResult {
+            text: text.to_string(),
+            tool_calls: Vec::new(),
+            stop_reason: stop.to_string(),
+            reasoning_content: String::new(),
+        })
+    }
+
+    fn native_deepseek_runtime(responses: Vec<Result<CompletionResult, String>>) -> Runtime {
+        let mut rt = Runtime::new(
+            "deepseek".to_string(),
+            "deepseek-v4-pro".to_string(),
+            "workspace-write".to_string(),
+            50,
+        );
+        rt.native_tool_calling = true;
+        rt.client = Box::new(MockProvider::with_tools_responses(responses));
+        rt
+    }
+
+    fn assert_no_back_to_back_user_messages(messages: &[ChatMessage]) {
+        for pair in messages.windows(2) {
+            assert!(
+                !(pair[0].role == "user" && pair[1].role == "user"),
+                "history has consecutive user messages: {:?}",
+                messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn native_empty_length_reply_explains_and_keeps_history_valid() {
+        // Reproduces the observed failure: reasoning consumed the whole
+        // budget, so content is empty and finish_reason=length, twice.
+        let mut rt = native_deepseek_runtime(vec![completion("", "length"), completion("", "length")]);
+        let first = rt.run_turn("Which bugs did you find in this project?");
+        assert!(first.text.contains("output budget"), "{}", first.text);
+        let second = rt.run_turn("?");
+        assert!(second.text.contains("output budget"), "{}", second.text);
+        assert_no_back_to_back_user_messages(&rt.messages);
+    }
+
+    #[test]
+    fn native_truncated_text_reply_is_continued_and_stitched() {
+        let mut rt = native_deepseek_runtime(vec![
+            completion("Bug 1: off-by-one. Bug 2: ", "length"),
+            completion("missing None check.", "stop"),
+        ]);
+        let turn = rt.run_turn("List the bugs.");
+        assert_eq!(turn.text, "Bug 1: off-by-one. Bug 2: missing None check.");
+        let roles: Vec<_> = rt.messages.iter().skip(1).map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant"], "continuation scaffolding must not stay in history");
+        assert!(!rt.messages.iter().any(|m| m.content.contains("Continue from exactly")));
+    }
+
+    #[test]
+    fn deepseek_thinking_models_get_room_for_reasoning() {
+        let caps = RuntimeType::capabilities_for("deepseek", "deepseek-v4-pro");
+        assert!(caps.recommended_max_output_tokens >= 32_768);
+    }
+
     #[test]
     fn capabilities_for_provider_model_matches_expected_defaults() {
         let deepseek = RuntimeType::capabilities_for("deepseek", "deepseek-v4-pro");
         assert!(deepseek.native_tool_calling_default);
         assert!(deepseek.native_tool_calling_supported);
-        assert_eq!(deepseek.recommended_max_output_tokens, 4096);
+        assert_eq!(deepseek.recommended_max_output_tokens, 32_768);
+        let deepseek_chat = RuntimeType::capabilities_for("deepseek", "deepseek-chat");
+        assert_eq!(deepseek_chat.recommended_max_output_tokens, 4096);
 
         let openai = RuntimeType::capabilities_for("openai", "gpt-5.3-codex");
         assert!(openai.native_tool_calling_default);
@@ -4532,7 +5184,7 @@ mod tests {
         let line = rt.status_provider_runtime_line();
         assert!(line.contains("native=true"));
         assert!(line.contains("supported=true"));
-        assert!(line.contains("recommended_max_output_tokens=4096"));
+        assert!(line.contains("recommended_max_output_tokens=32768"));
     }
 
     #[test]

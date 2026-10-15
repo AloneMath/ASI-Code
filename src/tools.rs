@@ -1772,55 +1772,59 @@ pub fn edit_file(path: &str, old: &str, new: &str) -> ToolResult {
     if old.is_empty() {
         return ToolResult::err("old text is empty — read the file first to get exact text");
     }
+    if old == new {
+        return ToolResult::err("old text and new text are identical — no edit was made");
+    }
 
-    let file_uses_crlf = text.contains("\r\n");
-    let mut old_for_diff = old.to_string();
-    let mut new_for_diff = new.to_string();
+    let file_prefers_crlf = prefers_crlf(&text);
 
-    let updated = {
-        let count = text.matches(old).count();
+    // Pass 1: exact match. Pass 2: same text with line endings converted to
+    // the file's dominant style. Only the matched region is rewritten, so
+    // untouched lines keep their original endings (mixed files stay mixed).
+    let mut candidates = vec![old.to_string()];
+    let old_in_file_style = with_line_endings(old, file_prefers_crlf);
+    if old_in_file_style != old {
+        candidates.push(old_in_file_style);
+    }
+
+    let mut matched: Option<String> = None;
+    for candidate in &candidates {
+        let count = text.matches(candidate.as_str()).count();
         if count == 1 {
-            text.replacen(old, new, 1)
-        } else if count > 1 {
-            return ToolResult::err(format!(
-                "old text found {} times — provide more surrounding context to make it unique",
-                count
-            ));
-        } else {
-            // Fallback for Windows line-ending mismatches (\r\n vs \n).
-            let text_lf = text.replace("\r\n", "\n");
-            let old_lf = old.replace("\r\n", "\n");
-            let new_lf = new.replace("\r\n", "\n");
-            let lf_count = text_lf.matches(&old_lf).count();
-            if lf_count == 1 {
-                let updated_lf = text_lf.replacen(&old_lf, &new_lf, 1);
-                old_for_diff = if file_uses_crlf {
-                    old_lf.replace('\n', "\r\n")
-                } else {
-                    old_lf.clone()
-                };
-                new_for_diff = if file_uses_crlf {
-                    new_lf.replace('\n', "\r\n")
-                } else {
-                    new_lf.clone()
-                };
-                if file_uses_crlf {
-                    updated_lf.replace('\n', "\r\n")
-                } else {
-                    updated_lf
-                }
-            } else if lf_count > 1 {
-                return ToolResult::err(format!(
-                    "old text matched {} times after newline normalization — provide more surrounding context",
-                    lf_count
-                ));
-            } else {
-                return ToolResult::err(
-                    "old text not found in file — make sure it matches exactly (including whitespace/newlines)",
-                );
-            }
+            matched = Some(candidate.clone());
+            break;
         }
+        if count > 1 {
+            let lines = match_line_numbers(&text, candidate);
+            return ToolResult::err(format!(
+                "old text found {} times (at lines {}) — provide more surrounding context to make it unique",
+                count,
+                lines
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    let Some(old_for_diff) = matched else {
+        let mut msg = "old text not found in file — make sure it matches exactly (including whitespace/newlines)".to_string();
+        if let Some(hint) = not_found_hint(&text, old) {
+            msg.push_str("\n");
+            msg.push_str(&hint);
+        }
+        return ToolResult::err(msg);
     };
+
+    // New text follows the line-ending style of the region it replaces.
+    let region_is_crlf = if old_for_diff.contains('\n') {
+        old_for_diff.contains("\r\n")
+    } else {
+        file_prefers_crlf
+    };
+    let new_for_diff = with_line_endings(new, region_is_crlf);
+    let updated = text.replacen(&old_for_diff, &new_for_diff, 1);
 
     match fs::write(path, &updated) {
         Ok(_) => {
@@ -1835,6 +1839,59 @@ pub fn edit_file(path: &str, old: &str, new: &str) -> ToolResult {
             ToolResult::ok(output)
         }
         Err(e) => ToolResult::err(e.to_string()),
+    }
+}
+
+/// True when CRLF line endings outnumber bare LF endings.
+fn prefers_crlf(text: &str) -> bool {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count();
+    crlf > 0 && crlf * 2 >= lf
+}
+
+fn with_line_endings(s: &str, crlf: bool) -> String {
+    let lf = s.replace("\r\n", "\n");
+    if crlf {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
+}
+
+/// 1-based line numbers where each occurrence of `needle` starts.
+fn match_line_numbers(text: &str, needle: &str) -> Vec<usize> {
+    text.match_indices(needle)
+        .map(|(offset, _)| text[..offset].matches('\n').count() + 1)
+        .collect()
+}
+
+/// Explain the most likely reason an edit's old text did not match, e.g.
+/// a line that exists with different indentation or trailing whitespace.
+fn not_found_hint(text: &str, old: &str) -> Option<String> {
+    let first = old.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let hits: Vec<usize> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == first)
+        .map(|(i, _)| i + 1)
+        .take(5)
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    let lines = hits.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "hint: the line `{}` exists at line(s) {} but surrounding text, indentation, or trailing whitespace differs — re-read that range and copy it exactly",
+        clip_for_hint(first, 80),
+        lines
+    ))
+}
+
+fn clip_for_hint(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>())
     }
 }
 
@@ -1860,14 +1917,33 @@ fn render_file_preview(path: &str, max_lines: usize, max_chars: usize) -> Result
 }
 
 pub fn glob_search(pattern: &str) -> ToolResult {
+    let explicit = glob_literal_segments(pattern);
     let mut lines = Vec::new();
+    let mut visited = 0usize;
+    let mut hit_visit_cap = false;
     if let Ok(entries) = glob(pattern) {
-        for (idx, e) in entries.flatten().enumerate() {
-            if idx >= 300 {
+        for e in entries.flatten() {
+            visited += 1;
+            if visited > GLOB_MAX_ENTRIES_VISITED {
+                hit_visit_cap = true;
+                break;
+            }
+            // Skip generated/vendored trees and ASI's own state so they do
+            // not crowd real project files out of the result cap.
+            if glob_entry_is_pruned(&e, &explicit) {
+                continue;
+            }
+            if lines.len() >= 300 {
                 break;
             }
             lines.push(e.display().to_string());
         }
+    }
+    if hit_visit_cap {
+        lines.push(format!(
+            "[glob truncated after visiting {} entries; use a narrower pattern]",
+            GLOB_MAX_ENTRIES_VISITED
+        ));
     }
     if lines.is_empty() {
         ToolResult::ok("No matches")
@@ -1912,11 +1988,48 @@ const GREP_PRUNE_DIRS: &[&str] = &[
     ".cache",
     "coverage",
     ".asi",
+    ".asi-rust-temp",
     ".codex",
     ".claude",
-    "sessions",
     "bench_reports",
 ];
+
+/// Shared prune rule for grep_search and glob_search. `sessions` is only
+/// pruned when it is ASI Code's session store (holds the checkpoint file),
+/// so a user's own `sessions/` package stays searchable.
+fn is_pruned_search_dir(path: &Path, name_lower: &str) -> bool {
+    if name_lower == "sessions" {
+        return path.join("_checkpoint_latest.json").is_file();
+    }
+    GREP_PRUNE_DIRS.iter().any(|p| *p == name_lower)
+}
+
+/// Upper bound on entries a glob may enumerate before giving up.
+const GLOB_MAX_ENTRIES_VISITED: usize = 50_000;
+
+/// Lowercased literal (wildcard-free) path segments of a glob pattern.
+/// A pruned directory named explicitly in the pattern is searched anyway.
+fn glob_literal_segments(pattern: &str) -> Vec<String> {
+    pattern
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && !s.contains(['*', '?', '[', '{']))
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+fn glob_entry_is_pruned(path: &Path, explicit: &[String]) -> bool {
+    path.ancestors().enumerate().any(|(i, dir)| {
+        // The entry itself only counts when it is a directory.
+        if i == 0 && !dir.is_dir() {
+            return false;
+        }
+        let Some(name) = dir.file_name().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let lower = name.to_ascii_lowercase();
+        !explicit.contains(&lower) && is_pruned_search_dir(dir, &lower)
+    })
+}
 
 pub fn grep_search(pattern: &str, base: &str) -> ToolResult {
     let regex = match Regex::new(pattern) {
@@ -2008,7 +2121,7 @@ fn walk(dir: &Path, regex: &Regex, out: &mut Vec<String>, files_visited: &mut us
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if GREP_PRUNE_DIRS.iter().any(|p| *p == dir_name) {
+            if is_pruned_search_dir(&path, &dir_name) {
                 continue;
             }
             walk(&path, regex, out, files_visited);
@@ -4042,17 +4155,30 @@ pub fn bash(command: &str) -> ToolResult {
         shell_command.clone()
     };
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("powershell");
-        c.arg("-NoProfile").arg("-Command").arg(&exec_shell_command);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-lc").arg(&exec_shell_command);
-        c
+    let backend = crate::sandbox::exec::ExecBackend::from_env();
+    let mut cmd = match &backend {
+        crate::sandbox::exec::ExecBackend::Docker(docker) => {
+            // Inside the container the shell is POSIX sh, so use the raw
+            // command rather than the PowerShell-normalized form.
+            crate::sandbox::exec::docker_command(
+                docker,
+                &crate::sandbox::exec::current_workspace(),
+                command,
+            )
+        }
+        crate::sandbox::exec::ExecBackend::Local if cfg!(target_os = "windows") => {
+            let mut c = Command::new("powershell");
+            c.arg("-NoProfile").arg("-Command").arg(&exec_shell_command);
+            c
+        }
+        crate::sandbox::exec::ExecBackend::Local => {
+            let mut c = Command::new("sh");
+            c.arg("-lc").arg(&exec_shell_command);
+            c
+        }
     };
 
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "windows") && backend == crate::sandbox::exec::ExecBackend::Local {
         if let Some(cache_dir) = ensure_windows_npm_cache_dir() {
             cmd.env("npm_config_cache", cache_dir);
         }
@@ -4062,6 +4188,18 @@ pub fn bash(command: &str) -> ToolResult {
     let mut child = match spawn_res {
         Ok(c) => c,
         Err(e) => return ToolResult::err(e.to_string()),
+    };
+    // Contain the whole process tree so a timeout (or the tool returning)
+    // can never leave orphaned descendants running.
+    let tree_guard = match crate::sandbox::exec::ProcessTreeGuard::attach(
+        &child,
+        crate::sandbox::exec::ProcessLimits::from_env(),
+    ) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("WARN sandbox: process-tree containment unavailable: {}", e);
+            None
+        }
     };
 
     let stdout = child.stdout.take();
@@ -4127,6 +4265,9 @@ pub fn bash(command: &str) -> ToolResult {
                 }
                 if elapsed >= timeout {
                     timed_out = true;
+                    if let Some(g) = &tree_guard {
+                        g.terminate();
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -4137,6 +4278,15 @@ pub fn bash(command: &str) -> ToolResult {
         }
     }
 
+    // Closing the job kills any descendants that outlived the shell; they
+    // would otherwise hold the output pipes open and block the readers.
+    // ASI_SANDBOX_KEEP_BACKGROUND=1 keeps intentional background servers
+    // alive by leaking the job handle instead of closing it.
+    if crate::sandbox::exec::keep_background_processes() {
+        std::mem::forget(tree_guard);
+    } else {
+        drop(tree_guard);
+    }
     let _ = out_handle.join();
     let _ = err_handle.join();
 
@@ -4393,7 +4543,7 @@ pub fn tool_index() -> String {
 mod tests {
     use super::{
         build_windows_cache_dir_repair_command, edit_file, is_autoresearch_cache_path,
-        grep_search,
+        glob_search, grep_search,
         decode_key_value_text_value,
         decode_path_value,
         split_internal_tool_invocation,
@@ -5094,6 +5244,139 @@ name='asi'
         assert!(!res.ok);
         assert!(res.output.contains("whitespace/newlines"));
 
+        let _ = fs::remove_file(path);
+    }
+
+    fn search_fixture() -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock issue")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("asi_search_prune_{}", nonce));
+        for dir in ["src", ".asi-rust-temp/blender", ".asi", "target/debug", "sessions", "app/sessions"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("src/main.py"), "NEEDLE = 1\n").unwrap();
+        fs::write(root.join(".asi-rust-temp/blender/lib.py"), "NEEDLE = 2\n").unwrap();
+        fs::write(root.join(".asi/probe.py"), "NEEDLE = 3\n").unwrap();
+        fs::write(root.join("target/debug/gen.py"), "NEEDLE = 4\n").unwrap();
+        // ASI session store (has the checkpoint) vs. a user package.
+        fs::write(root.join("sessions/_checkpoint_latest.json"), "{\"NEEDLE\": 5}").unwrap();
+        fs::write(root.join("app/sessions/store.py"), "NEEDLE = 6\n").unwrap();
+        root
+    }
+
+    #[test]
+    fn glob_search_skips_asi_state_and_generated_trees() {
+        let root = search_fixture();
+        let pattern = format!("{}/**/*", root.display()).replace('\\', "/");
+        let out = glob_search(&pattern).output.replace('\\', "/");
+        assert!(out.contains("src/main.py"), "{}", out);
+        assert!(out.contains("app/sessions/store.py"), "user sessions package must stay: {}", out);
+        for hidden in [".asi-rust-temp", "/.asi", "target/", "_checkpoint_latest"] {
+            assert!(!out.contains(hidden), "{} should be pruned: {}", hidden, out);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn glob_search_still_searches_explicitly_named_pruned_dir() {
+        let root = search_fixture();
+        let pattern = format!("{}/target/**/*.py", root.display()).replace('\\', "/");
+        let out = glob_search(&pattern).output;
+        assert!(out.contains("gen.py"), "{}", out);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn grep_search_uses_same_prune_rules() {
+        let root = search_fixture();
+        let out = grep_search("NEEDLE", &root.to_string_lossy()).output.replace('\\', "/");
+        assert!(out.contains("src/main.py"), "{}", out);
+        assert!(out.contains("app/sessions/store.py"), "{}", out);
+        assert!(!out.contains(".asi-rust-temp") && !out.contains("_checkpoint_latest"), "{}", out);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn edit_fixture(tag: &str, content: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock issue")
+            .as_nanos();
+        let path = env::temp_dir().join(format!("asi_tools_edit_{}_{}.txt", tag, nonce));
+        fs::write(&path, content).expect("write fixture failed");
+        path
+    }
+
+    #[test]
+    fn edit_file_crlf_file_gets_crlf_for_inserted_lines() {
+        let path = edit_fixture("crlf_insert", "fn a() {}\r\nfn b() {}\r\n");
+        let res = edit_file(path.to_string_lossy().as_ref(), "fn a() {}", "fn a() {}\nfn a2() {}");
+        assert!(res.ok, "{}", res.output);
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated, "fn a() {}\r\nfn a2() {}\r\nfn b() {}\r\n");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn edit_file_mixed_endings_only_touch_edited_region() {
+        let path = edit_fixture("mixed", "a\r\nb\r\nc\nd\n");
+        let res = edit_file(path.to_string_lossy().as_ref(), "a\nb", "x\ny");
+        assert!(res.ok, "{}", res.output);
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated, "x\r\ny\r\nc\nd\n");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn edit_file_lf_file_with_crlf_old_text() {
+        let path = edit_fixture("lf_file", "one\ntwo\nthree\n");
+        let res = edit_file(path.to_string_lossy().as_ref(), "one\r\ntwo", "1\r\n2");
+        assert!(res.ok, "{}", res.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1\n2\nthree\n");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn edit_file_multiple_matches_reports_line_numbers_and_leaves_file() {
+        let original = "let x = 1;\nfoo();\nlet x = 1;\n";
+        let path = edit_fixture("multi", original);
+        let res = edit_file(path.to_string_lossy().as_ref(), "let x = 1;", "let x = 2;");
+        assert!(!res.ok);
+        assert!(res.output.contains("found 2 times"), "{}", res.output);
+        assert!(res.output.contains("lines 1, 3"), "{}", res.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn edit_file_not_found_hints_indentation_mismatch() {
+        let path = edit_fixture("indent", "fn main() {\n    println!(\"hi\");\n}\n");
+        let res = edit_file(path.to_string_lossy().as_ref(), "println!(\"hi\");\n  }", "x");
+        assert!(!res.ok);
+        assert!(res.output.contains("line(s) 2"), "{}", res.output);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn edit_file_rejects_identical_old_and_new() {
+        let path = edit_fixture("noop", "same\n");
+        let res = edit_file(path.to_string_lossy().as_ref(), "same", "same");
+        assert!(!res.ok);
+        assert!(res.output.contains("identical"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn edit_file_preserves_utf8_bom_and_multibyte_text() {
+        // Multi-byte CJK comment written as escapes to keep the source ASCII.
+        let path = edit_fixture("bom", "\u{feff}// \u{6ce8}\u{91ca}\nlet v = 1;\n");
+        let res = edit_file(path.to_string_lossy().as_ref(), "let v = 1;", "let v = 2;");
+        assert!(res.ok, "{}", res.output);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "\u{feff}// \u{6ce8}\u{91ca}\nlet v = 2;\n"
+        );
         let _ = fs::remove_file(path);
     }
 

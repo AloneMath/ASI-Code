@@ -31,7 +31,23 @@ pub(crate) fn dispatch(command: crate::Command) -> Result<(), String> {
             repeat,
             suite,
             out_dir,
+            only,
+            baseline,
         } => {
+            if matches!(suite, crate::BenchSuite::Tasks) {
+                let msg = crate::bench_tasks::run(crate::bench_tasks::TasksOptions {
+                    provider,
+                    model,
+                    permission_mode,
+                    agent_max_steps,
+                    repeat,
+                    out_dir,
+                    only,
+                    baseline,
+                })?;
+                println!("{}", msg);
+                return Ok(());
+            }
             let msg = crate::bench::run(crate::bench::BenchOptions {
                 provider,
                 model,

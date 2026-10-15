@@ -105,20 +105,33 @@ fn run_parallel_batch_tool_results(
     constraints: ToolExecutionConstraints,
     commands: &[String],
 ) -> Vec<runtime::TurnResult> {
-    let mut tool_results = Vec::with_capacity(commands.len());
-    for command in commands {
+    // Constraint-blocked calls are answered locally; everything else in the
+    // batch (already partitioned as concurrency-safe) runs in one concurrent
+    // dispatch. Results are returned in the original call order.
+    let mut slots: Vec<Option<runtime::TurnResult>> = Vec::with_capacity(commands.len());
+    let mut runnable_indices = Vec::new();
+    let mut runnable = Vec::new();
+    for (index, command) in commands.iter().enumerate() {
         if let Some(reason) = toolcall_is_blocked_by_user_constraints(command, constraints) {
-            let blocked = constrained_tool_result(rt, reason);
-            tool_results.push(blocked);
+            slots.push(Some(constrained_tool_result(rt, reason)));
         } else {
-            let mut one = rt.run_manual_toolcall_batch_concurrent(&[command.clone()]);
-            tool_results.push(one.pop().unwrap_or(constrained_tool_result(
-                rt,
-                "blocked: empty tool result".to_string(),
-            )));
+            slots.push(None);
+            runnable_indices.push(index);
+            runnable.push(command.clone());
         }
     }
-    tool_results
+    let mut executed = rt.run_manual_toolcall_batch_concurrent(&runnable).into_iter();
+    for index in runnable_indices {
+        slots[index] = executed.next();
+    }
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                constrained_tool_result(rt, "blocked: empty tool result".to_string())
+            })
+        })
+        .collect()
 }
 
 fn run_sequential_tool_call_with_observation(
@@ -627,7 +640,7 @@ fn run_tool_loop_core(
                         reason
                     ),
                 );
-                let msg = rt.compact_with_summary(8);
+                let msg = rt.compact_with_summary_for_task(8, Some(task_input));
                 loop_info(mode, ui, &msg);
                 auto_compactions_done += 1;
             }
@@ -652,7 +665,11 @@ fn run_tool_loop_core(
                 &current.text,
             )
         {
-            let replayable_toolcalls = planned_toolcall_count(&current.text);
+            let replayable_toolcalls = engine
+                .parse_and_plan_for(&current.text, rt.strict_text_toolcall_parsing())
+                .iter()
+                .map(|b| b.calls.len())
+                .sum::<usize>();
             mixed_output_repair_attempts += 1;
             if matches!(mode, LoopMode::ReplVerbose) {
                 if looks_like_mixed_toolcall_and_result_output(&current.text) {
@@ -918,7 +935,7 @@ fn run_tool_loop_core(
             continue;
         }
 
-        let batches = engine.parse_and_plan(&current.text);
+        let batches = engine.parse_and_plan_for(&current.text, rt.strict_text_toolcall_parsing());
         let toolcall_count = batches.iter().map(|b| b.calls.len()).sum::<usize>();
         let (risky_toolcall_count, safe_toolcall_count) = toolcall_count_by_risk(&batches);
 
@@ -1529,6 +1546,25 @@ fn run_tool_loop_core(
 
         if !is_auto_loop_continuable_stop_reason(&current.stop_reason) {
             break;
+        }
+    }
+
+    // A budget stop (steps, time, no progress) can land right after a tool
+    // round, leaving the user with a raw tool result instead of an answer.
+    // Spend one tools-disabled call to turn the gathered evidence into one.
+    if let Some(reason) = loop_stop_reason.as_deref() {
+        let ended_on_tool_output = current.is_tool_result || rt.last_message_is_tool_result();
+        if ended_on_tool_output && current.stop_reason != "provider_error" {
+            loop_info(
+                mode,
+                ui,
+                "auto-agent: budget reached; writing final answer from gathered evidence (tools disabled)",
+            );
+            if let Some(answer) = rt.wrap_up_without_tools(task_input, reason) {
+                render_turn_output_for_mode(mode, ui, markdown_render, &answer, false, false);
+                extra_cost += answer.turn_cost_usd;
+                current = answer;
+            }
         }
     }
 

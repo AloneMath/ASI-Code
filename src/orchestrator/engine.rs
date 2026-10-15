@@ -16,7 +16,15 @@ impl OrchestratorEngine {
     }
 
     pub fn parse_and_plan(&self, text: &str) -> Vec<ExecutionBatch> {
-        let calls = parser::extract_tool_calls(text);
+        self.parse_and_plan_for(text, false)
+    }
+
+    pub fn parse_and_plan_for(&self, text: &str, strict: bool) -> Vec<ExecutionBatch> {
+        let calls = if strict {
+            parser::extract_tool_calls_strict(text)
+        } else {
+            parser::extract_tool_calls(text)
+        };
         scheduler::partition_tool_calls(calls)
     }
 
