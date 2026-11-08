@@ -11,6 +11,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Step-level `if:` cannot read the `secrets` context (doing so makes the
+    # whole workflow invalid and no jobs run). Expose only a boolean here.
+    env:
+      HAS_OPENAI_GATEWAY: ${{ secrets.OPENAI_BASE_URL != '' && secrets.OPENAI_API_KEY != '' }}
 
     steps:
       - name: Checkout
@@ -39,7 +43,7 @@ jobs:
             -ReportJsonPath .\artifacts\smoke_all_local.json
 
       - name: Windows smoke (gateway + tools)
-        if: matrix.os == 'windows-latest' && secrets.OPENAI_BASE_URL != '' && secrets.OPENAI_API_KEY != ''
+        if: matrix.os == 'windows-latest' && env.HAS_OPENAI_GATEWAY == 'true'
         shell: pwsh
         env:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
