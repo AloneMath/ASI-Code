@@ -238,6 +238,8 @@ The journal piggybacks on the existing single-file checkpoint, so disk footprint
 
 ## Future Direction: Closing the Feedback Loop
 
+ASI Code's most important development directions are **safety, superintelligence, and continuous learning**, with safety first.
+
 Today's large models are not mainly short of parameters, and more raw data alone only teaches them what is already in that data. What they lack most is a **verifiable, interactive, continuously learning feedback loop**.
 
 Claude Code and Codex draw their strength from first-party models co-trained with their own tools. ASI Code puts its strength in the **loop** instead. What model builders need most is real agent trajectories with verified outcome labels, and an agent tool produces exactly that as a natural by-product of doing its job.
