@@ -695,10 +695,16 @@ impl Runtime {
     }
 
     fn load_hook_config() -> HookConfig {
-        let hook_enabled = std::env::var("ASI_HOOKS_ENABLED")
+        let explicit = std::env::var("ASI_HOOKS_ENABLED")
             .ok()
-            .and_then(|v| Self::parse_boolish(&v))
-            .unwrap_or(false);
+            .and_then(|v| Self::parse_boolish(&v));
+        // Hooks installed at user level (`asi skills install`) are on without
+        // any environment setup; ASI_HOOKS_ENABLED=0 still turns them off.
+        // Project-level `.asi/hooks.json` is deliberately NOT auto-loaded: a
+        // cloned repository must never be able to run code just by being
+        // opened.
+        let user_hooks = user_hooks_config_path().filter(|p| p.is_file());
+        let hook_enabled = explicit.unwrap_or(user_hooks.is_some());
         if !hook_enabled {
             return HookConfig::default();
         }
@@ -742,6 +748,10 @@ impl Runtime {
 
         if let Some(path) = read("ASI_HOOK_CONFIG_PATH") {
             if let Ok(handlers) = Self::load_hook_handlers_from_file(&path) {
+                cfg.handlers = handlers;
+            }
+        } else if let Some(path) = user_hooks {
+            if let Ok(handlers) = Self::load_hook_handlers_from_file(&path.to_string_lossy()) {
                 cfg.handlers = handlers;
             }
         }
@@ -2953,6 +2963,20 @@ impl TurnResult {
     }
 }
 
+/// User-level hook config: `ASI_USER_HOOKS_PATH`, else `~/.asi/hooks.json`.
+/// Unit tests only honor the explicit variable so a developer's installed
+/// hooks never change test outcomes.
+pub fn user_hooks_config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("ASI_USER_HOOKS_PATH").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    if cfg!(test) {
+        return None;
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".asi").join("hooks.json"))
+}
+
 const COMPACTED_SUMMARY_HEADER: &str = "[COMPACTED CONTEXT — summary of earlier turns]";
 const PINNED_TASK_OPEN: &str = "[ORIGINAL TASK — verbatim]";
 const PINNED_TASK_CLOSE: &str = "[END ORIGINAL TASK]";
@@ -3748,6 +3772,10 @@ fn deny_reason(
         permissions::PermissionDecision::Deny { source, reason } => {
             return Some(format!("[{}] {}", source, reason));
         }
+    }
+
+    if let Err(e) = security::guard_secret_file_access(tool, args) {
+        return Some(e);
     }
 
     if let Err(e) = security::guard_tool_path_access(
@@ -5156,6 +5184,52 @@ mod tests {
     fn deepseek_thinking_models_get_room_for_reasoning() {
         let caps = RuntimeType::capabilities_for("deepseek", "deepseek-v4-pro");
         assert!(caps.recommended_max_output_tokens >= 32_768);
+    }
+
+    #[test]
+    fn user_level_hooks_load_without_env_and_env_can_disable() {
+        let dir = std::env::temp_dir().join(format!(
+            "asi_user_hooks_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hooks.json");
+        std::fs::write(
+            &path,
+            r#"{"handlers":[{"owner":"asi-skills","event":"PreToolUse","script":"guard","json_protocol":true}]}"#,
+        )
+        .unwrap();
+        let _p = EnvGuard::set("ASI_USER_HOOKS_PATH", &path.to_string_lossy());
+        std::env::remove_var("ASI_HOOKS_ENABLED");
+        std::env::remove_var("ASI_HOOK_CONFIG_PATH");
+        let cfg = Runtime::load_hook_config();
+        assert_eq!(cfg.handlers.len(), 1, "user hooks must load with no env setup");
+        assert_eq!(cfg.handlers[0].script, "guard");
+        {
+            let _off = EnvGuard::set("ASI_HOOKS_ENABLED", "0");
+            assert!(Runtime::load_hook_config().handlers.is_empty());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deny_reason_blocks_secret_files_by_default() {
+        let ws = std::env::temp_dir();
+        let reason = super::deny_reason(
+            "workspace-write",
+            "read_file",
+            ".env",
+            false,
+            false,
+            false,
+            &[],
+            &[],
+            false,
+            &ws,
+            &[],
+            &crate::sandbox::SandboxStrategy::from_env(),
+        );
+        assert!(reason.unwrap_or_default().contains("credential protection"));
     }
 
     #[test]

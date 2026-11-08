@@ -2130,6 +2130,17 @@ fn walk(dir: &Path, regex: &Regex, out: &mut Vec<String>, files_visited: &mut us
         if !path.is_file() {
             continue;
         }
+        // Matches would echo secret values to the model provider; ASI's own
+        // audit log is bookkeeping, not project content.
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if file_name.eq_ignore_ascii_case(".asi_audit.jsonl") {
+            continue;
+        }
+        if crate::security::is_secret_file_path(&path.to_string_lossy())
+            && !crate::security::secret_files_allowed_by_env()
+        {
+            continue;
+        }
         search_file(&path, regex, out, files_visited);
     }
 }
@@ -5291,7 +5302,11 @@ name='asi'
     #[test]
     fn grep_search_uses_same_prune_rules() {
         let root = search_fixture();
+        fs::write(root.join(".env"), "NEEDLE_SECRET=1\n").unwrap();
+        fs::write(root.join(".asi_audit.jsonl"), "{\"args_preview\":\"NEEDLE\"}\n").unwrap();
         let out = grep_search("NEEDLE", &root.to_string_lossy()).output.replace('\\', "/");
+        assert!(!out.contains("NEEDLE_SECRET"), "secret file must not be searched: {}", out);
+        assert!(!out.contains(".asi_audit.jsonl"), "audit log must not be searched: {}", out);
         assert!(out.contains("src/main.py"), "{}", out);
         assert!(out.contains("app/sessions/store.py"), "{}", out);
         assert!(!out.contains(".asi-rust-temp") && !out.contains("_checkpoint_latest"), "{}", out);

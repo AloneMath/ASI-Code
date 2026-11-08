@@ -27,6 +27,104 @@ pub fn guard_bash_command(
     Ok(())
 }
 
+/// Replace credential-looking literals with `[REDACTED]`. Used before
+/// anything is persisted (audit log) so a blocked secret is not stored
+/// on disk where a later search could surface it to the model.
+pub fn redact_secrets(text: &str) -> String {
+    static PATTERNS: std::sync::OnceLock<Vec<Regex>> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)",
+            r"\bAKIA[0-9A-Z]{16}\b",
+            r"\bgh[pousr]_[A-Za-z0-9]{36,}\b",
+            r"\bsk-(ant-)?[A-Za-z0-9_-]{24,}\b",
+        ]
+        .iter()
+        .map(|p| Regex::new(p).expect("valid redaction regex"))
+        .collect()
+    });
+    let mut out = text.to_string();
+    for re in patterns {
+        out = re.replace_all(&out, "[REDACTED]").into_owned();
+    }
+    out
+}
+
+/// True when `path` names a credential file: `.env` / `.env.*`, key and
+/// certificate files, or anything under `.ssh`, `.aws`, `.gnupg`.
+/// Templates such as `.env.example` are not secrets.
+pub fn is_secret_file_path(path: &str) -> bool {
+    let normalized = path.trim().replace('\\', "/").to_ascii_lowercase();
+    let parts: Vec<&str> = normalized.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    if [".example", ".sample", ".template", ".dist"].iter().any(|s| name.ends_with(s)) {
+        return false;
+    }
+    if parts[..parts.len() - 1].iter().any(|p| matches!(*p, ".ssh" | ".aws" | ".gnupg")) {
+        return true;
+    }
+    if *name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    if matches!(*name, ".npmrc" | ".pypirc" | ".netrc" | "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_dsa") {
+        return true;
+    }
+    [".pem", ".key", ".pfx", ".p12"].iter().any(|s| name.ends_with(s))
+}
+
+/// Target path of a file tool call, from either the legacy text form
+/// (`path <<<CONTENT ...`, `"quoted path" ...`) or a raw JSON object.
+fn file_tool_target_path(args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return v
+                .get("path")
+                .or_else(|| v.get("file_path"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+    let head = trimmed.split("<<<").next().unwrap_or("");
+    let (path, _) = split_first_arg(head);
+    strip_surrounding_quotes(path).to_string()
+}
+
+pub fn secret_files_allowed_by_env() -> bool {
+    matches!(
+        std::env::var("ASI_ALLOW_SECRET_FILES")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+/// Built-in credential protection, on by default. Tool output is sent to
+/// the model provider, so reading a secret file leaks it just as surely as
+/// writing one corrupts it. Opt out with ASI_ALLOW_SECRET_FILES=1.
+pub fn guard_secret_file_access(tool: &str, args: &str) -> Result<(), String> {
+    if secret_files_allowed_by_env() {
+        return Ok(());
+    }
+    let path = match tool {
+        "read_file" | "write_file" | "edit_file" => file_tool_target_path(args),
+        "grep_search" => strip_surrounding_quotes(&parse_grep_base_path(args.trim())).to_string(),
+        _ => return Ok(()),
+    };
+    if is_secret_file_path(&path) {
+        return Err(format!(
+            "credential protection: `{}` looks like a secret file and its contents would be sent to the model provider; ask the user to handle it (set ASI_ALLOW_SECRET_FILES=1 to disable this check)",
+            path
+        ));
+    }
+    Ok(())
+}
+
 pub fn guard_tool_path_access(
     tool: &str,
     args: &str,
@@ -506,6 +604,41 @@ pub fn check_resource_limits(_limits: &ResourceLimits) -> Result<(), String> {
     // For now, just return success
     // TODO: Implement proper resource monitoring
     Ok(())
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    use super::{guard_secret_file_access, is_secret_file_path, redact_secrets};
+
+    #[test]
+    fn redacts_credential_literals_but_keeps_context() {
+        let out = redact_secrets("notes.txt \"API_KEY = sk-PLACEHOLDERPLACEHOLDERPLACEHOLDER00\" AKIAABCDEFGHIJKLMNOP");
+        assert_eq!(out, "notes.txt \"API_KEY = [REDACTED]\" [REDACTED]");
+        assert_eq!(redact_secrets("cargo test --release"), "cargo test --release");
+    }
+
+    #[test]
+    fn classifies_secret_and_template_paths() {
+        for p in [".env", "app/.env.local", r"C:\Users\x\.ssh\config", "~/.aws/credentials", "certs/server.PEM", "id_ed25519"] {
+            assert!(is_secret_file_path(p), "{} should be secret", p);
+        }
+        for p in [".env.example", "src/env.rs", "environment.py", "docs/keys.md", "README.md", ""] {
+            assert!(!is_secret_file_path(p), "{} should not be secret", p);
+        }
+    }
+
+    #[test]
+    fn guards_every_file_tool_arg_shape() {
+        assert!(guard_secret_file_access("read_file", ".env").is_err());
+        assert!(guard_secret_file_access("read_file", "\"my app/.env\" 1 50").is_err());
+        assert!(guard_secret_file_access("write_file", "server.key <<<CONTENT\nx\n<<<END").is_err());
+        assert!(guard_secret_file_access("edit_file", r#"{"path":".env.prod","old_text":"a","new_text":"b"}"#).is_err());
+        assert!(guard_secret_file_access("grep_search", "TOKEN .env").is_err());
+        assert!(guard_secret_file_access("read_file", "src/main.rs 1 200").is_ok());
+        assert!(guard_secret_file_access("bash", "cat .env").is_ok(), "bash is the guard hook's job");
+        let err = guard_secret_file_access("read_file", ".env").unwrap_err();
+        assert!(err.contains("ASI_ALLOW_SECRET_FILES"), "{}", err);
+    }
 }
 
 #[cfg(test)]

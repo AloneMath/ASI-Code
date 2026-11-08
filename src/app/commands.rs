@@ -22,6 +22,17 @@ pub(crate) fn dispatch(command: crate::Command) -> Result<(), String> {
             println!("{}", msg);
             Ok(())
         }
+        crate::Command::Skills { action } => {
+            let msg = match action {
+                crate::SkillsAction::Install { path, python } => {
+                    crate::skills_install::install(&path, &python)?
+                }
+                crate::SkillsAction::Uninstall => crate::skills_install::uninstall()?,
+                crate::SkillsAction::Status => crate::skills_install::status()?,
+            };
+            println!("{}", msg);
+            Ok(())
+        }
         crate::Command::Bench {
             provider,
             model,

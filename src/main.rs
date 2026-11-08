@@ -30,6 +30,7 @@ mod security;
 mod self_update;
 mod session;
 mod skills;
+mod skills_install;
 mod telemetry;
 mod todo;
 mod tokenizer;
@@ -279,6 +280,11 @@ enum Command {
         #[arg(long, default_value_t = false)]
         restart: bool,
     },
+    /// Manage the asi-skills safety guard (user-level PreToolUse hook).
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
     Bench {
         #[arg(long)]
         provider: Option<String>,
@@ -377,6 +383,22 @@ impl Default for ExecutionSpeed {
     fn default() -> Self {
         ExecutionSpeed::Deep
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsAction {
+    /// Verify the guard in an asi-skills checkout and enable it for all sessions.
+    Install {
+        /// Path to the asi-skills repository (contains asi_skills/hook.py).
+        path: PathBuf,
+        /// Python interpreter used to run the guard.
+        #[arg(long, default_value = "python")]
+        python: String,
+    },
+    /// Remove the guard from the user-level hook config.
+    Uninstall,
+    /// Show guard and built-in credential protection state.
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -59,7 +59,7 @@ pub fn log_permission_decision(
         "model": model,
         "permission_mode": permission_mode,
         "tool": tool,
-        "args_preview": truncate(args, 200),
+        "args_preview": truncate(&crate::security::redact_secrets(args), 200),
         "allowed": allowed,
         "reason": reason,
     });
@@ -96,7 +96,7 @@ pub fn log_auto_review_decision(
         "auto_review_mode": auto_review_mode,
         "auto_review_threshold": auto_review_threshold,
         "tool": tool,
-        "args_preview": truncate(args, 200),
+        "args_preview": truncate(&crate::security::redact_secrets(args), 200),
         "severity": severity,
         "blocked": blocked,
         "reason": reason,
