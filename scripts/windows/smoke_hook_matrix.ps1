@@ -88,8 +88,11 @@ try {
 /exit
 "@
 
-    $denyOutput = $denyPrompt | & $AsiExe repl --provider deepseek --model deepseek-v4-pro --project $Project --no-setup 2>&1
-    $allowOutput = $allowPrompt | & $AsiExe repl --provider deepseek --model deepseek-v4-pro --project $Project --no-setup 2>&1
+    # The default permission mode is `on-request`, which asks the user
+    # interactively and denies when stdin is piped. Run in workspace-write so
+    # the hook matrix (not the approval prompt) is what decides.
+    $denyOutput = $denyPrompt | & $AsiExe repl --provider deepseek --model deepseek-v4-pro --permission-mode workspace-write --project $Project --no-setup 2>&1
+    $allowOutput = $allowPrompt | & $AsiExe repl --provider deepseek --model deepseek-v4-pro --permission-mode workspace-write --project $Project --no-setup 2>&1
 
     $denyText = ($denyOutput | Out-String)
     $allowText = ($allowOutput | Out-String)
